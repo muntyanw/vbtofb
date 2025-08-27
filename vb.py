@@ -1,5 +1,4 @@
 
-import time
 import signal
 from pynput import keyboard  # Для перехвата нажатия клавиш
 import threading  # Для запуска слушателя клавиатуры в отдельном потоке
@@ -8,10 +7,8 @@ from recognize_text import capture_and_recognize
 from find_message import *
 import time
 import asyncio
-from log import log_and_print
 from browser_utils import sendOneMessagessToFb
-from utils import read_setting, load_json
-from tg import send_message_to_tg_channel, init_tg
+from tg import send_message_to_tg_channel, startTgClient
 from log import log_and_print
 
 old_text = ""
@@ -20,13 +17,11 @@ processed_messages = set()
 # Семафор для последовательной обработки сообщений
 processing_semaphore = asyncio.Semaphore(1)
 
-service_channel_data = None
-service_channel_name = None
-name_viber = None
-bot_client = None
+async def process_one_message(message_text, bot_client, service_channel_name, name_viber):
 
-async def process_one_message(message_text):
-
+    log_and_print(f"bot_client: {bot_client}", 'info')
+    log_and_print(f"service_channel_name: {service_channel_name}", 'info')
+    log_and_print(f"name_viber: {name_viber}", 'info')
     # Добавляем ID сообщения в список обработанных
     processed_messages.add(message_text)
 
@@ -46,7 +41,11 @@ async def process_one_message(message_text):
             log_and_print(f"Oшибка при обработке одного сообщения: {e}", 'error')
             await asyncio.sleep(10)  # Задержка
 
-def main():
+async def main():
+
+    global bot_client
+    new_text = ""
+
     log_and_print("Запуск программы")
 
     # Load initial region from JSON
@@ -111,7 +110,7 @@ def main():
         except AttributeError:
             pass  # Ignore non-character key presses
 
-    init_tg()
+    bot_client, name_viber, service_channel_name = await startTgClient()
 
     # Start keyboard listener in a separate thread
     listener = keyboard.Listener(on_press=on_press)
@@ -128,11 +127,13 @@ def main():
                 added_text = find_addition(old_text, new_text)
                 if added_text:
                     log_and_print(f"Отправка нового текста в Facebook: {added_text}")
-                    process_one_message(added_text)
-                    old_text = new_text
-                    save_current_text(old_text)
+                    await process_one_message(added_text, bot_client, service_channel_name, name_viber)
                 else:
                     log_and_print("Не удалось определить добавленный текст.")
+
+                old_text = new_text
+                save_current_text(old_text)
+
             else:
                 log_and_print("Изменений в тексте не обнаружено.")
 

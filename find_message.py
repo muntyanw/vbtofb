@@ -25,7 +25,7 @@ def save_current_text(text, file_name='previous_text.txt'):
     except Exception as e:
         log_and_print(f"Ошибка при сохранении текста в файл {file_name}: {e}")
 
-def find_addition(old_text, new_text, match_ratio=0.8):
+def find_addition(old_text, new_text, match_ratio=0.6):
     """
     Ищет новый добавленный текст в новом тексте относительно старого текста.
     :param old_text: Старый текст.
@@ -70,12 +70,12 @@ def find_addition(old_text, new_text, match_ratio=0.8):
             return addition
 
     # Если совпадение не найдено
-    log_and_print("Совпадение не найдено.")
-    return None
+    log_and_print("Совпадение не найдено. Значит єто полностью новий текст.")
+    return new_text
 
 
     # Извлекаем часть нового текста, которая идёт после найденной подстроки
     addition_start = pos + len(last_part)
     addition = new_text[addition_start:].strip()
 
-    return addition
+    return addition.  strip()

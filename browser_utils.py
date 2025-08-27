@@ -40,6 +40,7 @@ def start_chrome_new(driver_path, chromedriver_port):
     #chrome_options.add_argument("--disable-dev-shm-usage")
 
     try:
+        log_and_print("Попитка запустить новая сессия Chrome.", 'info')
         driver = webdriver.Chrome(service=Service(driver_path), options=chrome_options)
         log_and_print("Запущена новая сессия Chrome.", 'info')
         return driver
@@ -206,6 +207,7 @@ def sendOneMessagessToFb(message, image_path=None):
     log_and_print(f"fb_groups {fb_groups}.", 'info')
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
+    log_and_print(f"current_dir: {current_dir}", 'info')
     driver_path = os.path.join(current_dir, 'chromedriver.exe')
     log_and_print(f"driver_path: {driver_path}", 'info')
 
