@@ -3,6 +3,7 @@ node_modules/
 __pycache__/
 .env
 venv/
+.idea/
 
 # Runtime/debug artifacts
 runtime_debug/
@@ -12,7 +13,9 @@ runtime_*.log
 sent_messages.json
 seen_messages.json
 bot_session.session
+install/*.session
 *.session-journal
+chrome-data/
 
 # Build artifacts
 build/
