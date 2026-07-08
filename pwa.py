@@ -27,9 +27,13 @@ class AutoBridge:
         self.name_viber = name_viber
         self.channel_names = channel_names
         self.settings = settings
-        self.store = MessageStore(
+        self.sent_store = MessageStore(
             path=settings.get("sent_messages_file", "sent_messages.json"),
             max_items=int(settings.get("sent_messages_limit", 1000)),
+        )
+        self.seen_store = MessageStore(
+            path=settings.get("seen_messages_file", "seen_messages.json"),
+            max_items=int(settings.get("seen_messages_limit", settings.get("sent_messages_limit", 1000))),
         )
         self.viber = ViberWindow(settings)
         self.pending_candidates = {}
@@ -84,8 +88,20 @@ class AutoBridge:
 
         for signature in list(self.pending_candidates):
             if signature not in visible_signatures:
-                log_and_print(f"[AutoBridge] Candidate disappeared before read, skipping: {signature}")
-                self.pending_candidates.pop(signature, None)
+                pending = self.pending_candidates[signature]
+                if self.find_near_candidate(pending, visible):
+                    pending["misses"] = 0
+                    continue
+
+                pending["misses"] = pending.get("misses", 0) + 1
+                if pending["misses"] > self._candidate_missing_tolerance():
+                    log_and_print(f"[AutoBridge] Candidate disappeared before read, skipping: {signature}")
+                    self.pending_candidates.pop(signature, None)
+                else:
+                    log_and_print(
+                        f"[AutoBridge] Candidate temporarily missing before read: "
+                        f"{signature}, misses={pending['misses']}/{self._candidate_missing_tolerance()}"
+                    )
 
         ready = []
         for candidate in visible:
@@ -93,9 +109,18 @@ class AutoBridge:
             if signature in self.known_candidate_signatures:
                 continue
 
+            pending_key = signature
             pending = self.pending_candidates.get(signature)
             if pending is None:
+                near_pending_key = self.find_pending_key_for_candidate(candidate)
+                if near_pending_key:
+                    pending_key = near_pending_key
+                    pending = self.pending_candidates[near_pending_key]
+
+            if pending is None:
                 candidate["first_seen"] = now
+                candidate["misses"] = 0
+                candidate["_pending_key"] = signature
                 self.pending_candidates[signature] = candidate
                 log_and_print(
                     f"[AutoBridge] New candidate queued for delayed read: signature={signature}, "
@@ -103,43 +128,58 @@ class AutoBridge:
                 )
                 continue
 
+            pending["misses"] = 0
+            first_seen = pending["first_seen"]
             pending.update(candidate)
+            pending["first_seen"] = first_seen
+            pending["_pending_key"] = pending_key
             if now - pending["first_seen"] >= self._read_delay():
                 ready.append(pending)
 
         for candidate in ready:
             signature = candidate["signature"]
-            confirmed = self.find_visible_candidate_by_signature(signature)
+            pending_key = candidate.get("_pending_key", signature)
+            confirmed = self.find_visible_candidate_for_pending(candidate)
             if not confirmed:
                 log_and_print(
                     f"[AutoBridge] Delayed candidate was not found on second scan, skipping: "
                     f"{signature}",
                     "warning",
                 )
-                self.pending_candidates.pop(signature, None)
+                self.pending_candidates.pop(pending_key, None)
                 continue
 
             log_and_print(
                 f"[AutoBridge] Delayed candidate confirmed on second scan: {confirmed['signature']}"
             )
             message = self.copy_candidate_after_delay(confirmed)
-            self.pending_candidates.pop(signature, None)
+            self.pending_candidates.pop(pending_key, None)
 
             if not message:
                 continue
 
-            if message["type"] == "text" and self.store.is_new_text(message["text"]):
-                await self.send_text(message["text"])
+            if message["type"] == "text" and self.seen_store.has_text(message["text"]):
+                log_and_print("[AutoBridge] Text was already seen before sending, skipping.")
                 self.known_candidate_signatures.add(signature)
-            elif message["type"] == "text":
+            elif message["type"] == "text" and self.sent_store.has_text(message["text"]):
                 log_and_print("[AutoBridge] Text already sent before, skipping duplicate.")
                 self.known_candidate_signatures.add(signature)
-            elif message["type"] == "image" and self.store.is_new_image(message["image_hash"]):
-                await self.send_image(message["image"], message["image_hash"])
+            elif message["type"] == "text":
+                if await self.send_text(message["text"]):
+                    self.sent_store.mark_text(message["text"])
+                    self.seen_store.mark_text(message["text"])
+                    self.known_candidate_signatures.add(signature)
+            elif message["type"] == "image" and self.seen_store.has_image(message["image_hash"]):
+                log_and_print("[AutoBridge] Image was already seen before sending, skipping.")
                 self.known_candidate_signatures.add(signature)
-            elif message["type"] == "image":
+            elif message["type"] == "image" and self.sent_store.has_image(message["image_hash"]):
                 log_and_print("[AutoBridge] Image already sent before, skipping duplicate.")
                 self.known_candidate_signatures.add(signature)
+            elif message["type"] == "image":
+                if await self.send_image(message["image"], message["image_hash"]):
+                    self.sent_store.mark_image(message["image_hash"])
+                    self.seen_store.mark_image(message["image_hash"])
+                    self.known_candidate_signatures.add(signature)
             elif message["type"] == "video":
                 log_and_print(
                     "[AutoBridge] Video was detected by OCR, but automatic safe video extraction "
@@ -192,24 +232,58 @@ class AutoBridge:
             if not message:
                 continue
 
-            if message["type"] == "text" and self.store.is_new_text(message["text"]):
+            if message["type"] == "text" and self.seen_store.mark_text(message["text"]):
                 marked += 1
-            elif message["type"] == "image" and self.store.is_new_image(message["image_hash"]):
+            elif message["type"] == "image" and self.seen_store.mark_image(message["image_hash"]):
                 marked += 1
             elif message["type"] == "video":
                 marked += 1
 
         log_and_print(f"[AutoBridge] Baseline messages marked as already seen: {marked}")
 
-    def find_visible_candidate_by_signature(self, signature):
+    def find_visible_candidate_for_pending(self, pending):
         self.viber.focus()
         self.viber.scroll_to_bottom(self._setting_int("scroll_to_bottom_count", 2))
         candidates = self.collect_visible_candidates()
         self.save_debug_screenshot("second_scan")
         for candidate in candidates:
-            if candidate["signature"] == signature:
+            if candidate["signature"] == pending["signature"]:
                 return candidate
+
+        near = self.find_near_candidate(pending, candidates)
+        if near:
+            log_and_print(
+                f"[AutoBridge] Exact signature changed; using nearby same-type candidate. "
+                f"old={pending['signature']}, new={near['signature']}"
+            )
+        return near
+
+    def find_pending_key_for_candidate(self, candidate):
+        for pending_key, pending in self.pending_candidates.items():
+            if self.candidates_are_near(pending, candidate):
+                return pending_key
         return None
+
+    def find_near_candidate(self, candidate, candidates):
+        same_type = [
+            item for item in candidates
+            if self.candidates_are_near(candidate, item)
+        ]
+        if not same_type:
+            return None
+        return min(
+            same_type,
+            key=lambda item: abs(item["x"] - candidate["x"]) + abs(item["y"] - candidate["y"]),
+        )
+
+    def candidates_are_near(self, first, second):
+        if first["type"] != second["type"]:
+            return False
+        tolerance = self._candidate_match_tolerance()
+        return (
+            abs(int(first["x"]) - int(second["x"])) <= tolerance
+            and abs(int(first["y"]) - int(second["y"])) <= tolerance
+        )
 
     def inspect_candidate_at(self, x, y):
         visual_hash = self.screen_patch_hash(x, y)
@@ -385,8 +459,10 @@ class AutoBridge:
 
     async def send_text(self, text):
         log_and_print(f"[AutoBridge] Sending text to Telegram: {text}")
+        results = []
         for channel_name in self.channel_names:
-            await process_one_message(text, self.bot_client, channel_name, self.name_viber, None)
+            results.append(await process_one_message(text, self.bot_client, channel_name, self.name_viber, None))
+        return bool(results) and all(results)
 
     async def send_image(self, image, image_hash):
         bio = BytesIO()
@@ -395,14 +471,23 @@ class AutoBridge:
         bio.seek(0)
 
         log_and_print(f"[AutoBridge] Sending image to Telegram: {bio.name}")
+        results = []
         for channel_name in self.channel_names:
-            await process_one_message("", self.bot_client, channel_name, self.name_viber, bio)
+            bio.seek(0)
+            results.append(await process_one_message("", self.bot_client, channel_name, self.name_viber, bio))
+        return bool(results) and all(results)
 
     def _check_interval(self):
         return self._setting_int("check_interval_seconds", 5)
 
     def _read_delay(self):
         return self._setting_int("read_delay_seconds", self._setting_int("pause_read_messages_second", 60))
+
+    def _candidate_missing_tolerance(self):
+        return self._setting_int("candidate_missing_tolerance", 4)
+
+    def _candidate_match_tolerance(self):
+        return self._setting_int("candidate_match_tolerance_px", 180)
 
     def _setting_int(self, name, default):
         try:

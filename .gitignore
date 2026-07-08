@@ -3,3 +3,19 @@ node_modules/
 __pycache__/
 .env
 venv/
+
+# Runtime/debug artifacts
+runtime_debug/
+debug_run*/
+debug_*.png
+runtime_*.log
+sent_messages.json
+seen_messages.json
+bot_session.session
+*.session-journal
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe

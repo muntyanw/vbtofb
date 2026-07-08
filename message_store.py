@@ -37,11 +37,25 @@ class MessageStore:
         message_hash = hash_text(text)
         if not message_hash or self.has_text_hash(message_hash):
             return False
+        return True
+
+    def is_new_image(self, image_hash):
+        if not image_hash or self.has_image(image_hash):
+            return False
+        return True
+
+    def mark_text(self, text):
+        message_hash = hash_text(text)
+        return self.mark_text_hash(message_hash)
+
+    def mark_text_hash(self, message_hash):
+        if not message_hash or self.has_text_hash(message_hash):
+            return False
         self.text_hashes.appendleft(message_hash)
         self.save()
         return True
 
-    def is_new_image(self, image_hash):
+    def mark_image(self, image_hash):
         if not image_hash or self.has_image(image_hash):
             return False
         self.image_hashes.appendleft(image_hash)

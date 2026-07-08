@@ -32,11 +32,14 @@ async def send_message_to_tg_channel(bot_client, channel_name, message_text, ima
             )
 
         log_and_print(f"Сообщение успешно отправлено в канал: {channel_name}", 'info')
+        return True
 
     except RPCError as e:
         log_and_print(f"Ошибка при отправке сообщения в канал: {e}", 'error')
+        return False
     except Exception as e:
         log_and_print(f"Непредвиденная ошибка при отправке сообщения в канал: {e}", 'error')
+        return False
 
 async def check_connection(bot_client):
     while True:
