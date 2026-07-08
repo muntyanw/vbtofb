@@ -1,16 +1,8 @@
 {
-  "fb_creds": {
-    "muntyanw@gmail.com": {
-      "password": "!!!Muntyan76!!!"
-    }
-  },
   "tg_creds": {
-    "bot_token": "7658487162:AAEmSzNUCZ2caOp2rxuo6DeL8Vfcu-aehaA",
-    "api_id": "24364263",
-    "api_hash": "1f03c4f0e8617dd5fe4f16e9d629f47c",
-    "bot_tokenOld": "7842420854:AAEWF6fVpVZletNzVMXV7AOldoZCGBFS8nY",
-    "api_idOld": "14728509",
-    "api_hashOld": "713a87f265352ee8d606dbc9c4df605f"
+    "bot_token": "8050034432:AAG6aSitp1BMeWkqrd3GR_djV1JhkK6qPdw",
+    "api_id": "14728509",
+    "api_hash": "713a87f265352ee8d606dbc9c4df605f"
   }
 
 }

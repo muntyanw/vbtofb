@@ -1,0 +1,75 @@
+{
+  "out_dir": "debug_run",
+  "steps": [
+    {
+      "name": "window_open",
+      "screenshot": "debug_run\\01_window_open.png"
+    },
+    {
+      "name": "messages_region",
+      "region": [
+        580,
+        112,
+        1062,
+        790
+      ],
+      "screenshot": "debug_run\\02_messages_region.png"
+    },
+    {
+      "name": "context_menu_0",
+      "x": 813,
+      "y": 890,
+      "screenshot": "debug_run\\03_context_menu_0.png"
+    },
+    {
+      "name": "menu_region_0",
+      "region": [
+        773,
+        710,
+        260,
+        260
+      ],
+      "screenshot": "debug_run\\04_menu_region_0.png"
+    },
+    {
+      "name": "ocr_result_0",
+      "menu_items": {
+        "isText": null,
+        "isImage": null,
+        "isVideo": null
+      },
+      "action": null
+    },
+    {
+      "name": "context_menu_1",
+      "x": 941,
+      "y": 890,
+      "screenshot": "debug_run\\05_context_menu_1.png"
+    },
+    {
+      "name": "menu_region_1",
+      "region": [
+        901,
+        710,
+        260,
+        260
+      ],
+      "screenshot": "debug_run\\06_menu_region_1.png"
+    },
+    {
+      "name": "ocr_result_1",
+      "menu_items": {
+        "isText": null,
+        "isImage": null,
+        "isVideo": null
+      },
+      "action": null
+    }
+  ],
+  "messages_region": [
+    580,
+    112,
+    1062,
+    790
+  ]
+}

@@ -1,0 +1,42 @@
+[
+  {
+    "type": "image",
+    "x": 461,
+    "y": 252,
+    "visual_hash": "441c84f84ce248b8b086f054fbb550c37e887dee09c5778d1f8f3aef80a8a15c",
+    "signature": "image:441c84f84ce248b8b086f054fbb550c37e887dee09c5778d1f8f3aef80a8a15c",
+    "key": "image:461:252:441c84f84ce248b8b086f054fbb550c37e887dee09c5778d1f8f3aef80a8a15c"
+  },
+  {
+    "type": "image",
+    "x": 461,
+    "y": 382,
+    "visual_hash": "3975cc853303326ec0404364e416d56e90ca3fdc2dcda6a6551c58c15d2879af",
+    "signature": "image:3975cc853303326ec0404364e416d56e90ca3fdc2dcda6a6551c58c15d2879af",
+    "key": "image:461:382:3975cc853303326ec0404364e416d56e90ca3fdc2dcda6a6551c58c15d2879af"
+  },
+  {
+    "type": "image",
+    "x": 461,
+    "y": 512,
+    "visual_hash": "5351de35d6effefc61984f957178756bcdaa39ab912380dbe407bb4395e51b1d",
+    "signature": "image:5351de35d6effefc61984f957178756bcdaa39ab912380dbe407bb4395e51b1d",
+    "key": "image:461:512:5351de35d6effefc61984f957178756bcdaa39ab912380dbe407bb4395e51b1d"
+  },
+  {
+    "type": "image",
+    "x": 461,
+    "y": 642,
+    "visual_hash": "9ecb58463011bf85af130fa28faa0993f81c84fc1f035680dacdce8d000d9569",
+    "signature": "image:9ecb58463011bf85af130fa28faa0993f81c84fc1f035680dacdce8d000d9569",
+    "key": "image:461:642:9ecb58463011bf85af130fa28faa0993f81c84fc1f035680dacdce8d000d9569"
+  },
+  {
+    "type": "image",
+    "x": 534,
+    "y": 902,
+    "visual_hash": "0c85448f1c4badc67b66d1e061e5762e398655e1c26a0bf3ee00ff10d8bb58a4",
+    "signature": "image:0c85448f1c4badc67b66d1e061e5762e398655e1c26a0bf3ee00ff10d8bb58a4",
+    "key": "image:534:902:0c85448f1c4badc67b66d1e061e5762e398655e1c26a0bf3ee00ff10d8bb58a4"
+  }
+]

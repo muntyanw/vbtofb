@@ -1,0 +1,62 @@
+{
+  "out_dir": "debug_run5",
+  "steps": [
+    {
+      "name": "window_open",
+      "screenshot": "debug_run5\\01_window_open.png"
+    },
+    {
+      "name": "messages_region",
+      "region": [
+        328,
+        123,
+        606,
+        791
+      ],
+      "screenshot": "debug_run5\\02_messages_region.png"
+    },
+    {
+      "name": "context_menu_0",
+      "x": 461,
+      "y": 902,
+      "screenshot": "debug_run5\\03_context_menu_0.png"
+    },
+    {
+      "name": "menu_region_0",
+      "region": [
+        421,
+        722,
+        260,
+        260
+      ],
+      "screenshot": "debug_run5\\04_menu_region_0.png"
+    },
+    {
+      "name": "ocr_result_0",
+      "menu_items": {
+        "isText": [
+          92,
+          37,
+          159,
+          25
+        ],
+        "isImage": null,
+        "isVideo": null
+      },
+      "action": "text"
+    }
+  ],
+  "messages_region": [
+    328,
+    123,
+    606,
+    791
+  ],
+  "candidate": {
+    "type": "text",
+    "x": 461,
+    "y": 902,
+    "visual_hash": "7ab01820e843a7268026a8f74d10768710587c7fd598e7b37aa0ec15b75d4c4d",
+    "key": "text:461:902:7ab01820e843a7268026a8f74d10768710587c7fd598e7b37aa0ec15b75d4c4d"
+  }
+}

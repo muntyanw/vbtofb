@@ -1,10 +1,8 @@
-from telethon import TelegramClient, events
-from browser_utils import sendOneMessagessToFb
 from log import log_and_print  # Импорт функции логирования
 import asyncio
 from telethon.errors import RPCError
 from telethon import TelegramClient
-from utils import read_setting, load_json
+from init import init
 
 # Глобальный флаг для предотвращения двойной реакции
 processed_messages = set()
@@ -14,20 +12,9 @@ processing_semaphore = asyncio.Semaphore(1)
 telegram_channel_name = None
 telegram_channel_id = None
 
-def init_tg():
-    global name_viber
-    global service_channel_name
-
-    name_viber = read_setting('name_viber')
-    service_channels = read_setting('service_tg_channels')
-    if not service_channels:
-        log_and_print("Список сервісних каналів пуст.", 'warning')
-        return
-    service_channel_data = service_channels[0]
-    service_channel_name = service_channel_data.get('service_channel_name')
-
 async def send_message_to_tg_channel(bot_client, channel_name, message_text, image_path=None):
     try:
+
         # Получаем объект канала
         channel_entity = await bot_client.get_entity(channel_name)
 
@@ -74,29 +61,39 @@ async def start_listening(bot_client):
             log_and_print(f"Ошибка при прослушивании Telegram: {e}. Переподключение через 5 секунд...", 'error')
             await asyncio.sleep(5)  # Задержка перед повторной попыткой
 
-async def startTgClient(fb_creds, fb_groups, settings):
-
+async def startTgClient():
     try:
-        creds = load_json('creds.json')
-        tg_creds = creds.get('tg_creds', {})
-        log_and_print(f"tg_creds {tg_creds}.", 'info')
+        tg_creds, tg_channels, settings = init()
+
+        name_viber = settings.get('name_viber')
+        log_and_print(f"name_viber:{name_viber}")
+
+        channels = tg_channels.get('channels', [])
+        if not channels:
+            log_and_print("Список каналів пуст.", 'warning')
+            return
+
+        channel_names = [channel["telegram_channel_name"] for channel in channels]
+
+        service_channels = tg_channels.get('service_channels', [])
+        service_channel_data = service_channels[0]
+        service_channel_name = service_channel_data.get('service_channel_name')
 
         bot_token = tg_creds.get('bot_token')
         api_id = tg_creds.get('api_id')
         api_hash = tg_creds.get('api_hash')
 
-        #sendOneMessagessToFb("", fb_creds, fb_groups, image_path="E:\\ttofb\\downloads\\31.jpg")
 
-        if not (telegram_channel_name and bot_token and api_id and api_hash):
+        if not (service_channel_name and bot_token and api_id and api_hash):
             log_and_print("Недостаточно данных для подключения к Telegram.", 'error')
-            return
+            return None
 
         # Создаем клиент Telethon
         bot_client = TelegramClient('bot_session', api_id, api_hash)
 
         while True:
             try:
-                log_and_print(f"Запуск клиента с токеном: {bot_token}", 'info')
+                log_and_print(f"Запуск клиента с токеном: {mask_secret(bot_token)}", 'info')
                 await bot_client.start(bot_token=bot_token)
                 log_and_print("Клиент успешно запущен.", 'info')
 
@@ -116,3 +113,12 @@ async def startTgClient(fb_creds, fb_groups, settings):
 
     except Exception as e:
         log_and_print(f"Ошибка при запуске клиента: {e}", 'error')
+
+    return  bot_client, name_viber, service_channel_name, channel_names
+
+
+def mask_secret(value):
+    value = str(value or "")
+    if len(value) <= 10:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"

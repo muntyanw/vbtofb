@@ -1,19 +1,76 @@
 {
-  "name_viber": "Samarkand",
-  "capture_and_recognize": {
-    "lang": "rus+ukr+pol",
-    "custom_config": "--oem 3 --psm 6"
-  },
-   "fone_colors": [
-    "Светло-серая иллюстрация, фоновое изображение",
-    "Сплошной бирюзовый, фон",
-    "Розовая иллюстрация, фоновое изображение",
-    "Розово-желтый градиент, фоновое изображение"
-  ],
-  "chromedriver_port": 9223,
-  "service_tg_channels": [
-    {
-      "service_channel_name": -1002260176427
-    }
-  ]
+    "name_viber": "Viber1",
+    "capture_and_recognize": {
+        "lang": "rus",
+        "custom_config": "--oem 3 --psm 6"
+    },
+    "search_board_mess_x_start": 373,
+    "search_board_mess_x_end": 981,
+    "search_board_mess_y_start": 176,
+    "search_board_mess_y_end": 1017,
+    "visualize": 0,
+    "count_scroll_up": 4,
+    "count_scroll_down": 3,
+    "count_repeat": 4,
+    "word_comment": [
+        "\u041f\u0440\u043e\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c",
+        "\u041a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0438",
+        "\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0439"
+    ],
+    "max_chars_member": 800,
+    "pause_read_messages_second": 60,
+    "read_delay_seconds": 60,
+    "check_interval_seconds": 5,
+    "debug_screenshots_enabled": true,
+    "debug_screenshot_dir": "runtime_debug",
+    "sent_messages_file": "sent_messages.json",
+    "sent_messages_limit": 1000,
+    "viber_window_title_re": ".*Viber.*",
+    "viber_exe_path": "C:\\Users\\ariab\\AppData\\Local\\Viber\\Viber.exe",
+    "viber_open_timeout_seconds": 20,
+    "viber_window_placement": "left_half",
+    "taskbar_reserved_height": 48,
+    "context_menu_open_delay_ms": 350,
+    "clipboard_wait_ms": 700,
+    "candidate_patch_size": 80,
+    "video_save_enabled": false,
+    "viber_channel": {
+        "title": "",
+        "logo_template": "",
+        "logo_match_threshold": 0.82
+    },
+    "auto_capture": {
+        "left_sidebar_width": 320,
+        "header_height": 92,
+        "input_height": 110,
+        "right_padding": 18,
+        "top_padding": 0,
+        "bottom_padding": 0,
+        "scan_step_px": 130,
+        "scan_top_skip_px": 18,
+        "scan_bottom_skip_px": 12,
+        "message_click_x_ratio": 0.22,
+        "message_click_x_ratios": [
+            0.22,
+            0.34
+        ]
+    },
+    "context_menu": {
+        "width": 260,
+        "height": 260,
+        "left_offset": -40,
+        "top_offset": -180,
+        "first_action_offset_x": 90,
+        "first_action_offset_y": 4
+    },
+    "search_phrases": {
+        "isText": "\u0421\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435",
+        "isImage": "\u041a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0444\u043e\u0442\u043e",
+        "isVideo": "\u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c"
+    },
+    "path_files_downloads": "C:\\Users\\ariab\\OneDrive\\\u0414\u043e\u043a\u0443\u043c\u0435\u043d\u0442\u044b\\ViberDownloads\\",
+    "comment_height": 20,
+    "comment_width": 142,
+    "indent_up": 200,
+    "indent_down": 400
 }
