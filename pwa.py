@@ -70,7 +70,6 @@ class AutoBridge:
         self.save_debug_screenshot("visible_scan")
         if not self.baseline_ready:
             self.known_candidate_signatures = {candidate["signature"] for candidate in visible}
-            self.mark_baseline_messages_as_seen(visible)
             self.baseline_ready = True
             log_and_print(
                 "[AutoBridge] Baseline captured; existing visible messages will not be sent: "
@@ -158,10 +157,7 @@ class AutoBridge:
             if not message:
                 continue
 
-            if message["type"] == "text" and self.seen_store.has_text(message["text"]):
-                log_and_print("[AutoBridge] Text was already seen before sending, skipping.")
-                self.known_candidate_signatures.add(signature)
-            elif message["type"] == "text" and self.sent_store.has_text(message["text"]):
+            if message["type"] == "text" and self.sent_store.has_text(message["text"]):
                 log_and_print("[AutoBridge] Text already sent before, skipping duplicate.")
                 self.known_candidate_signatures.add(signature)
             elif message["type"] == "text":
@@ -169,9 +165,6 @@ class AutoBridge:
                     self.sent_store.mark_text(message["text"])
                     self.seen_store.mark_text(message["text"])
                     self.known_candidate_signatures.add(signature)
-            elif message["type"] == "image" and self.seen_store.has_image(message["image_hash"]):
-                log_and_print("[AutoBridge] Image was already seen before sending, skipping.")
-                self.known_candidate_signatures.add(signature)
             elif message["type"] == "image" and self.sent_store.has_image(message["image_hash"]):
                 log_and_print("[AutoBridge] Image already sent before, skipping duplicate.")
                 self.known_candidate_signatures.add(signature)
@@ -215,31 +208,6 @@ class AutoBridge:
         log_and_print(f"[AutoBridge] Visible candidates found: {len(candidates)}")
         self.write_debug_json("visible_candidates", candidates)
         return candidates
-
-    def mark_baseline_messages_as_seen(self, candidates):
-        marked = 0
-        for candidate in candidates:
-            try:
-                message = self.copy_candidate_after_delay(candidate)
-            except Exception as exc:
-                log_and_print(
-                    f"[AutoBridge] Failed to mark baseline candidate as seen: "
-                    f"{candidate.get('signature')}: {exc}",
-                    "warning",
-                )
-                continue
-
-            if not message:
-                continue
-
-            if message["type"] == "text" and self.seen_store.mark_text(message["text"]):
-                marked += 1
-            elif message["type"] == "image" and self.seen_store.mark_image(message["image_hash"]):
-                marked += 1
-            elif message["type"] == "video":
-                marked += 1
-
-        log_and_print(f"[AutoBridge] Baseline messages marked as already seen: {marked}")
 
     def find_visible_candidate_for_pending(self, pending):
         self.viber.focus()
@@ -462,7 +430,7 @@ class AutoBridge:
         results = []
         for channel_name in self.channel_names:
             results.append(await process_one_message(text, self.bot_client, channel_name, self.name_viber, None))
-        return bool(results) and all(results)
+        return any(results)
 
     async def send_image(self, image, image_hash):
         bio = BytesIO()
@@ -475,7 +443,7 @@ class AutoBridge:
         for channel_name in self.channel_names:
             bio.seek(0)
             results.append(await process_one_message("", self.bot_client, channel_name, self.name_viber, bio))
-        return bool(results) and all(results)
+        return any(results)
 
     def _check_interval(self):
         return self._setting_int("check_interval_seconds", 5)

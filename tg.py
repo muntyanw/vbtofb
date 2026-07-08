@@ -14,6 +14,19 @@ telegram_channel_id = None
 
 async def send_message_to_tg_channel(bot_client, channel_name, message_text, image_path=None):
     try:
+        message_text = str(message_text or "")
+        if message_text:
+            log_and_print(
+                f"Telegram payload preview: {message_text[:120]!r}; "
+                f"unicode={message_text[:120].encode('unicode_escape').decode('ascii')}",
+                "info",
+            )
+            if looks_like_broken_encoding(message_text):
+                log_and_print(
+                    "Telegram send blocked: text looks encoding-corrupted before send.",
+                    "error",
+                )
+                return False
 
         # Получаем объект канала
         channel_entity = await bot_client.get_entity(channel_name)
@@ -125,3 +138,20 @@ def mask_secret(value):
     if len(value) <= 10:
         return "***"
     return f"{value[:4]}...{value[-4:]}"
+
+
+def looks_like_broken_encoding(text):
+    if not text:
+        return False
+
+    question_count = text.count("?")
+    if question_count < 3:
+        return False
+
+    cyrillic_count = sum(1 for char in text if "\u0400" <= char <= "\u04ff")
+    latin_count = sum(1 for char in text if "A" <= char <= "z")
+    visible_count = sum(1 for char in text if not char.isspace())
+    if visible_count == 0:
+        return False
+
+    return question_count / visible_count > 0.3 and cyrillic_count == 0 and latin_count == 0
