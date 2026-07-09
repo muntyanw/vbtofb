@@ -1,5 +1,6 @@
 import ctypes
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 from datetime import datetime
 
@@ -22,14 +23,28 @@ def _configure_text_output():
 
 _configure_text_output()
 
-logging.basicConfig(
-    filename='log.log',
-    filemode='w',
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    encoding='utf-8-sig',
-    force=True,
-)
+LOG_FILE = "log.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+
+
+def _configure_logging():
+    handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8-sig",
+    )
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+
+
+_configure_logging()
 
 def log_and_print(message, level='info'):
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
