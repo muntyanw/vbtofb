@@ -76,8 +76,9 @@ class MessageStore:
 def normalize_text(text):
     if not text:
         return ""
-    lines = [line.strip() for line in text.replace("\r", "\n").split("\n")]
-    return "\n".join(line for line in lines if line)
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in text.split("\n")]
+    return "\n".join(lines).strip("\n")
 
 
 def hash_text(text):
