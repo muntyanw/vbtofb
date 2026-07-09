@@ -283,7 +283,7 @@ class AutoBridge:
             f"expected={expected_type}, actual={action}, items={menu_items}"
         )
 
-        if action != expected_type:
+        if not self.actions_compatible(expected_type, action):
             self.close_context_menu(x, y)
             return None
 
@@ -291,18 +291,18 @@ class AutoBridge:
             self.close_context_menu(x, y)
             return {"type": "video", "key": candidate["key"]}
 
-        menu_key = self.menu_key_for_action(action)
+        menu_key = self.menu_key_for_action(action, menu_items)
         self.click_menu_item(menu_region, menu_items[menu_key])
         cv2.waitKey(self._setting_int("clipboard_wait_ms", 700))
         self.save_debug_screenshot("after_delayed_copy")
 
-        if action == "text":
+        if action in ("text", "copy"):
             text = normalize_text(reformat_telegram_text(pyperclip.paste()))
             if text:
                 log_and_print(f"[AutoBridge] Clipboard text copied: chars={len(text)}")
                 return {"type": "text", "text": text, "key": f"text:{text}"}
 
-        if action == "image":
+        if action in ("image", "copy"):
             image = ImageGrab.grabclipboard()
             if isinstance(image, Image.Image):
                 image_hash = hash_image(image)
@@ -353,28 +353,50 @@ class AutoBridge:
         ]
 
     def read_context_menu(self, menu_region):
+        search_phrases = dict(self.settings.get("search_phrases", {}))
+        search_phrases.setdefault("isCopy", ["Копировать", "Скопировать"])
+        search_phrases.setdefault("isPhotoWord", ["фото", "фот"])
         menu_items = capture_and_find_multiple_text_coordinates(
             menu_region,
-            self.settings.get("search_phrases", {}),
+            search_phrases,
         )
         log_and_print(f"[AutoBridge] OCR context menu: region={menu_region}, items={menu_items}")
         return menu_items
 
     def choose_menu_action(self, menu_items):
-        if menu_items.get("isText"):
-            return "text"
         if menu_items.get("isImage"):
+            return "image"
+        if menu_items.get("isCopy") and menu_items.get("isPhotoWord"):
             return "image"
         if menu_items.get("isVideo"):
             return "video"
+        if menu_items.get("isText"):
+            return "text"
+        if menu_items.get("isCopy"):
+            return "copy"
         return None
 
-    def menu_key_for_action(self, action):
-        return {
+    def actions_compatible(self, expected, actual):
+        if expected == actual:
+            return True
+        if expected == "copy" and actual in ("text", "image", "copy"):
+            return True
+        if actual == "copy" and expected in ("text", "image", "copy"):
+            return True
+        return False
+
+    def menu_key_for_action(self, action, menu_items):
+        preferred_key = {
             "text": "isText",
             "image": "isImage",
             "video": "isVideo",
+            "copy": "isCopy",
         }[action]
+        if menu_items.get(preferred_key):
+            return preferred_key
+        if action in ("text", "image", "copy") and menu_items.get("isCopy"):
+            return "isCopy"
+        return preferred_key
 
     def click_menu_item(self, menu_region, item_rect):
         x, y, w, h = item_rect

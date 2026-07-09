@@ -74,7 +74,7 @@ def capture_and_find_multiple_text_coordinates(region, search_phrases):
 
         result = {}
         for key, phrase in search_phrases.items():
-            result[key] = find_phrase_coordinates(data, phrase)
+            result[key] = find_any_phrase_coordinates(data, phrase)
 
         for key, coords in result.items():
             phrase = search_phrases[key]
@@ -129,6 +129,17 @@ def find_phrase_coordinates(data, phrase):
     return None
 
 
+def find_any_phrase_coordinates(data, phrases):
+    if isinstance(phrases, str):
+        phrases = [phrases]
+
+    for phrase in phrases:
+        coords = find_phrase_coordinates(data, phrase)
+        if coords is not None:
+            return coords
+    return None
+
+
 def normalize_ocr_text(text):
     text = (text or "").strip().lower().replace("ё", "е")
     return "".join(char for char in text if char.isalnum() or char.isspace())
@@ -137,6 +148,9 @@ def normalize_ocr_text(text):
 def words_match(expected, actual):
     if expected == actual:
         return True
+    if len(expected) >= 3 and len(actual) >= 3:
+        if expected.startswith(actual) or actual.startswith(expected):
+            return True
     if len(expected) < 4 or len(actual) < 4:
         return False
     return SequenceMatcher(None, expected, actual).ratio() >= 0.78
