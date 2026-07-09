@@ -99,10 +99,7 @@ async def startTgClient():
             log_and_print("Список каналів пуст.", 'warning')
             return
 
-        channel_names = [
-            normalize_channel_target(channel["telegram_channel_name"])
-            for channel in channels
-        ]
+        channel_names = [channel_target_from_config(channel) for channel in channels]
         for channel_name in channel_names:
             if is_invite_link_target(channel_name):
                 log_and_print(
@@ -186,6 +183,14 @@ def normalize_channel_target(value):
             return text
 
     return text
+
+
+def channel_target_from_config(channel):
+    for key in ("telegram_chat_id", "telegram_channel_id", "chat_id", "id"):
+        if key in channel and channel[key] not in (None, ""):
+            return normalize_channel_target(channel[key])
+
+    return normalize_channel_target(channel.get("telegram_channel_name", ""))
 
 
 def is_invite_link_target(value):
