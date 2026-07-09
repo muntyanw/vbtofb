@@ -467,7 +467,10 @@ def hash_image(image):
 
 async def main():
     try:
-        bot_client, name_viber, _, channel_names = await startTgClient()
+        tg_start = await startTgClient()
+        if not tg_start:
+            raise RuntimeError("Telegram client failed to start. See previous log lines for details.")
+        bot_client, name_viber, _, channel_names = tg_start
         _, _, settings = load_config()
         bridge = AutoBridge(bot_client, name_viber, channel_names, settings)
         await bridge.run()

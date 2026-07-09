@@ -1,5 +1,6 @@
 from log import log_and_print  # Импорт функции логирования
 import asyncio
+import traceback
 from telethon.errors import RPCError
 from telethon import TelegramClient
 from init import init
@@ -88,6 +89,10 @@ async def start_listening(bot_client):
             await asyncio.sleep(5)  # Задержка перед повторной попыткой
 
 async def startTgClient():
+    bot_client = None
+    name_viber = None
+    service_channel_name = None
+    channel_names = []
     try:
         tg_creds, tg_channels, settings = init()
 
@@ -147,8 +152,12 @@ async def startTgClient():
 
     except Exception as e:
         log_and_print(f"Ошибка при запуске клиента: {e}", 'error')
+        log_and_print(traceback.format_exc(), "error")
 
-    return  bot_client, name_viber, service_channel_name, channel_names
+    if bot_client is None:
+        return None
+
+    return bot_client, name_viber, service_channel_name, channel_names
 
 
 def mask_secret(value):
