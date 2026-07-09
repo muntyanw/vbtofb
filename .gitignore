@@ -13,7 +13,7 @@ debug_*.png
 runtime_*.log
 sent_messages.json
 seen_messages.json
-bot_session.session
+bot_session*.session
 install/*.session
 *.session-journal
 chrome-data/

@@ -1,5 +1,7 @@
 from log import log_and_print  # Импорт функции логирования
 import asyncio
+from datetime import datetime
+from pathlib import Path
 import traceback
 from telethon.errors import RPCError
 from telethon import TelegramClient
@@ -128,7 +130,7 @@ async def startTgClient():
             return None
 
         # Создаем клиент Telethon
-        bot_client = TelegramClient('bot_session', api_id, api_hash)
+        bot_client = create_telegram_client('bot_session', api_id, api_hash)
 
         while True:
             try:
@@ -165,6 +167,43 @@ def mask_secret(value):
     if len(value) <= 10:
         return "***"
     return f"{value[:4]}...{value[-4:]}"
+
+
+def create_telegram_client(session_name, api_id, api_hash):
+    try:
+        return TelegramClient(session_name, api_id, api_hash)
+    except ValueError as exc:
+        if "too many values to unpack" not in str(exc):
+            raise
+
+        recovered_session = quarantine_session_files(session_name)
+        log_and_print(
+            f"Telegram session {session_name!r} was incompatible/corrupt; "
+            f"using {recovered_session!r}.",
+            "warning",
+        )
+        return TelegramClient(recovered_session, api_id, api_hash)
+
+
+def quarantine_session_files(session_name):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    recovered_session = session_name
+    for suffix in (".session", ".session-journal"):
+        path = Path(f"{session_name}{suffix}")
+        if not path.exists():
+            continue
+        target = path.with_name(f"{path.name}.bad_{stamp}")
+        try:
+            path.replace(target)
+            log_and_print(f"Moved old Telegram session file to {target}", "warning")
+        except OSError as exc:
+            recovered_session = f"{session_name}_recovered_{stamp}"
+            log_and_print(
+                f"Could not move old Telegram session file {path}: {exc}. "
+                f"Will use new session file {recovered_session}.session",
+                "warning",
+            )
+    return recovered_session
 
 
 def normalize_channel_target(value):
