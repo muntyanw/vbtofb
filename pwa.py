@@ -10,11 +10,13 @@ from pathlib import Path
 import cv2
 import pyautogui
 import pyperclip
+import win32clipboard
+import win32con
 from PIL import Image, ImageGrab
 
 from init import init as load_config
 from log import log_and_print
-from message_store import MessageStore, normalize_text
+from message_store import MessageStore, hash_file, normalize_text
 from recognize_text import capture_and_find_multiple_text_coordinates
 from tg import startTgClient
 from vb_utils import process_one_message, reformat_telegram_text
@@ -178,13 +180,15 @@ class AutoBridge:
                     self.known_candidate_signatures.add(signature)
                     self.known_candidate_signatures.add(confirmed["signature"])
             elif message["type"] == "video":
-                log_and_print(
-                    "[AutoBridge] Video was detected by OCR, but automatic safe video extraction "
-                    "is disabled. Enable video_save_enabled only after a controlled test.",
-                    "warning",
-                )
-                self.known_candidate_signatures.add(signature)
-                self.known_candidate_signatures.add(confirmed["signature"])
+                if self.sent_store.has_file(message["file_hash"]):
+                    log_and_print("[AutoBridge] Video already sent before, skipping duplicate.")
+                    self.known_candidate_signatures.add(signature)
+                    self.known_candidate_signatures.add(confirmed["signature"])
+                elif await self.send_video(message["file_path"], message["file_hash"]):
+                    self.sent_store.mark_file(message["file_hash"])
+                    self.seen_store.mark_file(message["file_hash"])
+                    self.known_candidate_signatures.add(signature)
+                    self.known_candidate_signatures.add(confirmed["signature"])
 
     def collect_visible_candidates(self):
         region = self.viber.messages_region()
@@ -263,12 +267,19 @@ class AutoBridge:
         self.save_debug_screenshot("before_delayed_copy")
         current_hash = self.screen_patch_hash(x, y)
         if current_hash != candidate["visual_hash"]:
-            log_and_print(
-                f"[AutoBridge] Candidate patch changed before read; aborting this copy attempt. "
-                f"key={candidate['key']}, old_hash={candidate['visual_hash']}, new_hash={current_hash}",
-                "warning",
-            )
-            return None
+            if expected_type == "video":
+                log_and_print(
+                    f"[AutoBridge] Video candidate patch changed before read; continuing with menu recheck. "
+                    f"key={candidate['key']}, old_hash={candidate['visual_hash']}, new_hash={current_hash}",
+                    "warning",
+                )
+            else:
+                log_and_print(
+                    f"[AutoBridge] Candidate patch changed before read; aborting this copy attempt. "
+                    f"key={candidate['key']}, old_hash={candidate['visual_hash']}, new_hash={current_hash}",
+                    "warning",
+                )
+                return None
 
         pyperclip.copy("")
         self.viber.click_in_messages(x, y, button="right")
@@ -287,9 +298,8 @@ class AutoBridge:
             self.close_context_menu(x, y)
             return None
 
-        if action == "video" and not self.settings.get("video_save_enabled", False):
-            self.close_context_menu(x, y)
-            return {"type": "video", "key": candidate["key"]}
+        if action == "video":
+            return self.copy_video_after_select(candidate, menu_region, menu_items)
 
         menu_key = self.menu_key_for_action(action, menu_items)
         self.click_menu_item(menu_region, menu_items[menu_key])
@@ -315,6 +325,163 @@ class AutoBridge:
                 }
 
         log_and_print(f"[AutoBridge] Clipboard did not contain expected data for action={action}.", "warning")
+        return None
+
+    def copy_video_after_select(self, candidate, menu_region, menu_items):
+        x = candidate["x"]
+        y = candidate["y"]
+        select_rect = menu_items.get("isSelect")
+        if not select_rect:
+            log_and_print(f"[AutoBridge] Video menu has no Select item; items={menu_items}", "warning")
+            self.close_context_menu(x, y)
+            return None
+
+        log_and_print("[AutoBridge] Video detected; selecting video before copy.")
+        self.click_menu_item(menu_region, select_rect)
+        cv2.waitKey(self._setting_int("video_select_wait_ms", 500))
+        self.save_debug_screenshot("video_selected")
+
+        pyperclip.copy("")
+        self.viber.click_in_messages(x, y, button="right")
+        cv2.waitKey(self._setting_int("context_menu_open_delay_ms", 350))
+        self.save_debug_screenshot("video_copy_context_menu")
+
+        copy_menu_region = self.menu_region_around(x, y)
+        copy_menu_items = self.read_context_menu(copy_menu_region)
+        log_and_print(f"[AutoBridge] Video copy menu items: {copy_menu_items}")
+        copy_rect = copy_menu_items.get("isCopy")
+        if not copy_rect:
+            self.close_context_menu(x, y)
+            log_and_print("[AutoBridge] Video copy menu has no Copy item.", "warning")
+            return None
+
+        self.click_menu_item(copy_menu_region, copy_rect)
+        cv2.waitKey(self._setting_int("video_clipboard_wait_ms", self._setting_int("clipboard_wait_ms", 700)))
+        self.save_debug_screenshot("after_video_copy")
+
+        paths = self.read_clipboard_file_paths()
+        if not paths:
+            log_and_print(
+                "[AutoBridge] Clipboard did not contain video file paths after Copy; "
+                "trying Show in folder fallback.",
+                "warning",
+            )
+            paths = self.reveal_video_file_from_viber(candidate)
+        if not paths:
+            log_and_print("[AutoBridge] Could not resolve video file path.", "warning")
+            return None
+
+        file_path = self.choose_video_file(paths)
+        if not file_path:
+            log_and_print(f"[AutoBridge] Clipboard file paths are not usable video files: {paths}", "warning")
+            return None
+
+        file_digest = hash_file(file_path)
+        file_size = Path(file_path).stat().st_size
+        log_and_print(
+            f"[AutoBridge] Clipboard video copied: path={file_path}, size={file_size}, hash={file_digest}"
+        )
+        return {
+            "type": "video",
+            "file_path": file_path,
+            "file_hash": file_digest,
+            "key": f"video:{file_digest}",
+        }
+
+    def reveal_video_file_from_viber(self, candidate):
+        x = candidate["x"]
+        y = candidate["y"]
+
+        self.viber.focus()
+        self.viber.click_in_messages(x, y, button="right")
+        cv2.waitKey(self._setting_int("context_menu_open_delay_ms", 350))
+        self.save_debug_screenshot("video_show_in_folder_menu")
+
+        menu_region = self.menu_region_around(x, y)
+        menu_items = self.read_context_menu(menu_region)
+        show_rect = menu_items.get("isShowInFolder")
+        if not show_rect:
+            self.close_context_menu(x, y)
+            log_and_print(f"[AutoBridge] Show in folder item not found for video: {menu_items}", "warning")
+            return []
+
+        self.click_menu_item(menu_region, show_rect)
+        cv2.waitKey(self._setting_int("video_show_in_folder_wait_ms", 5000))
+        self.save_debug_screenshot("video_folder_opened")
+
+        pyautogui.hotkey("ctrl", "c")
+        cv2.waitKey(self._setting_int("video_folder_clipboard_wait_ms", 500))
+        paths = self.read_clipboard_file_paths()
+        if not paths:
+            recent = self.find_recent_downloaded_video()
+            if recent:
+                paths = [recent]
+
+        if self.settings.get("video_close_folder_after_path", True):
+            pyautogui.hotkey("alt", "f4")
+            cv2.waitKey(300)
+            self.viber.focus()
+
+        return paths
+
+    def find_recent_downloaded_video(self):
+        root = Path(self.settings.get("path_files_downloads", "") or "")
+        if not root.exists():
+            return None
+
+        video_extensions = {
+            ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp", ".wmv",
+        }
+        newest = None
+        for path in root.rglob("*"):
+            try:
+                if not path.is_file() or path.suffix.lower() not in video_extensions:
+                    continue
+                if newest is None or path.stat().st_mtime > newest.stat().st_mtime:
+                    newest = path
+            except OSError:
+                continue
+
+        if newest:
+            log_and_print(f"[AutoBridge] Recent downloaded video fallback: {newest}")
+            return str(newest)
+        return None
+
+    def read_clipboard_file_paths(self):
+        paths = []
+        try:
+            win32clipboard.OpenClipboard()
+            if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
+                paths = list(win32clipboard.GetClipboardData(win32con.CF_HDROP))
+        except Exception as exc:
+            log_and_print(f"[AutoBridge] Failed to read file paths from clipboard: {exc}", "warning")
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+
+        if not paths:
+            try:
+                clipboard_data = ImageGrab.grabclipboard()
+                if isinstance(clipboard_data, list):
+                    paths = [str(item) for item in clipboard_data]
+            except Exception as exc:
+                log_and_print(f"[AutoBridge] PIL clipboard file fallback failed: {exc}", "warning")
+
+        log_and_print(f"[AutoBridge] Clipboard file paths: {paths}")
+        return paths
+
+    def choose_video_file(self, paths):
+        video_extensions = {
+            ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp", ".wmv",
+        }
+        existing = [Path(path) for path in paths if Path(path).is_file()]
+        for path in existing:
+            if path.suffix.lower() in video_extensions:
+                return str(path)
+        if existing:
+            return str(existing[0])
         return None
 
     def save_debug_screenshot(self, label):
@@ -356,6 +523,8 @@ class AutoBridge:
         search_phrases = dict(self.settings.get("search_phrases", {}))
         search_phrases.setdefault("isCopy", ["Копировать", "Скопировать"])
         search_phrases.setdefault("isPhotoWord", ["фото", "фот"])
+        search_phrases.setdefault("isShowInFolder", ["Показать в папке"])
+        search_phrases.setdefault("isSelect", ["Выбрать"])
         menu_items = capture_and_find_multiple_text_coordinates(
             menu_region,
             search_phrases,
@@ -368,6 +537,8 @@ class AutoBridge:
             return "image"
         if menu_items.get("isCopy") and menu_items.get("isPhotoWord"):
             return "image"
+        if menu_items.get("isShowInFolder"):
+            return "video"
         if menu_items.get("isVideo"):
             return "video"
         if menu_items.get("isText"):
@@ -389,11 +560,13 @@ class AutoBridge:
         preferred_key = {
             "text": "isText",
             "image": "isImage",
-            "video": "isVideo",
+            "video": "isShowInFolder",
             "copy": "isCopy",
         }[action]
         if menu_items.get(preferred_key):
             return preferred_key
+        if action == "video" and menu_items.get("isVideo"):
+            return "isVideo"
         if action in ("text", "image", "copy") and menu_items.get("isCopy"):
             return "isCopy"
         return preferred_key
@@ -442,6 +615,13 @@ class AutoBridge:
         for channel_name in self.channel_names:
             bio.seek(0)
             results.append(await process_one_message("", self.bot_client, channel_name, self.name_viber, bio))
+        return any(results)
+
+    async def send_video(self, file_path, file_hash):
+        log_and_print(f"[AutoBridge] Sending video to Telegram: {file_path}, hash={file_hash}")
+        results = []
+        for channel_name in self.channel_names:
+            results.append(await process_one_message("", self.bot_client, channel_name, self.name_viber, file_path))
         return any(results)
 
     def _check_interval(self):

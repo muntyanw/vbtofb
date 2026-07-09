@@ -130,7 +130,8 @@ async def startTgClient():
             return None
 
         # Создаем клиент Telethon
-        bot_client = create_telegram_client('bot_session', api_id, api_hash)
+        session_name = settings.get("telegram_session_name", "bot_session_v2")
+        bot_client = create_telegram_client(session_name, api_id, api_hash)
 
         while True:
             try:

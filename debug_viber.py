@@ -155,6 +155,12 @@ def summarize_copied(copied):
             "size": image.size,
             "image_hash": copied.get("image_hash"),
         }
+    if copied["type"] == "video":
+        return {
+            "type": "video",
+            "file_path": copied.get("file_path"),
+            "file_hash": copied.get("file_hash"),
+        }
     return {"type": copied.get("type")}
 
 

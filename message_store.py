@@ -10,6 +10,7 @@ class MessageStore:
         self.max_items = max_items
         self.text_hashes = deque(maxlen=max_items)
         self.image_hashes = deque(maxlen=max_items)
+        self.file_hashes = deque(maxlen=max_items)
         self.load()
 
     def load(self):
@@ -24,11 +25,13 @@ class MessageStore:
 
         self.text_hashes = deque(data.get("text_hashes", []), maxlen=self.max_items)
         self.image_hashes = deque(data.get("image_hashes", []), maxlen=self.max_items)
+        self.file_hashes = deque(data.get("file_hashes", []), maxlen=self.max_items)
 
     def save(self):
         data = {
             "text_hashes": list(self.text_hashes),
             "image_hashes": list(self.image_hashes),
+            "file_hashes": list(self.file_hashes),
         }
         with open(self.path, "w", encoding="utf-8") as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
@@ -62,6 +65,13 @@ class MessageStore:
         self.save()
         return True
 
+    def mark_file(self, file_hash):
+        if not file_hash or self.has_file(file_hash):
+            return False
+        self.file_hashes.appendleft(file_hash)
+        self.save()
+        return True
+
     def has_text(self, text):
         message_hash = hash_text(text)
         return self.has_text_hash(message_hash)
@@ -71,6 +81,9 @@ class MessageStore:
 
     def has_image(self, image_hash):
         return bool(image_hash and image_hash in self.image_hashes)
+
+    def has_file(self, file_hash):
+        return bool(file_hash and file_hash in self.file_hashes)
 
 
 def normalize_text(text):
@@ -86,3 +99,11 @@ def hash_text(text):
     if not normalized:
         return None
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def hash_file(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
