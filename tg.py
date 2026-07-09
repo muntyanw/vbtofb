@@ -14,6 +14,16 @@ telegram_channel_id = None
 
 async def send_message_to_tg_channel(bot_client, channel_name, message_text, image_path=None):
     try:
+        channel_name = normalize_channel_target(channel_name)
+        if is_invite_link_target(channel_name):
+            log_and_print(
+                "Telegram target is an invite link/hash, not a sendable chat entity. "
+                "Add the bot to that group and use its numeric chat id (-100...), "
+                "or use a public @username.",
+                "error",
+            )
+            return False
+
         message_text = str(message_text or "")
         if message_text:
             log_and_print(
@@ -89,7 +99,18 @@ async def startTgClient():
             log_and_print("Список каналів пуст.", 'warning')
             return
 
-        channel_names = [channel["telegram_channel_name"] for channel in channels]
+        channel_names = [
+            normalize_channel_target(channel["telegram_channel_name"])
+            for channel in channels
+        ]
+        for channel_name in channel_names:
+            if is_invite_link_target(channel_name):
+                log_and_print(
+                    f"Telegram channel target {channel_name!r} is an invite link/hash. "
+                    "It cannot be used for bot sending; use numeric chat id (-100...) "
+                    "or a public username.",
+                    "warning",
+                )
 
         service_channels = tg_channels.get('service_channels', [])
         service_channel_data = service_channels[0]
@@ -138,6 +159,49 @@ def mask_secret(value):
     if len(value) <= 10:
         return "***"
     return f"{value[:4]}...{value[-4:]}"
+
+
+def normalize_channel_target(value):
+    if isinstance(value, int):
+        return value
+
+    text = str(value or "").strip()
+    if not text:
+        return text
+
+    lowered = text.lower()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if lowered.startswith(prefix):
+            text = text[len(prefix):]
+            break
+
+    text = text.split("?", 1)[0].strip("/")
+    if text.startswith("@"):
+        text = text[1:]
+
+    if text.lstrip("-").isdigit():
+        try:
+            return int(text)
+        except ValueError:
+            return text
+
+    return text
+
+
+def is_invite_link_target(value):
+    if isinstance(value, int):
+        return False
+
+    text = str(value or "").strip()
+    lowered = text.lower()
+    if lowered.startswith(("https://t.me/+", "http://t.me/+", "t.me/+")):
+        return True
+    if lowered.startswith(("https://t.me/joinchat/", "http://t.me/joinchat/", "t.me/joinchat/")):
+        return True
+    normalized = normalize_channel_target(text)
+    return isinstance(normalized, str) and (
+        normalized.startswith("+") or normalized.lower().startswith("joinchat/")
+    )
 
 
 def looks_like_broken_encoding(text):
