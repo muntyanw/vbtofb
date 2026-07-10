@@ -41,6 +41,9 @@ class AutoBridge:
         self.pending_candidates = {}
         self.known_candidate_signatures = set()
         self.baseline_ready = False
+        self.backlog_scanned_signatures = set()
+        self.backlog_consecutive_delivered = 0
+        self.backlog_complete = False
         self.debug_dir = Path(settings.get("debug_screenshot_dir", "runtime_debug"))
         self.debug_screenshots = bool(settings.get("debug_screenshots_enabled", True))
         self.shot_index = 0
@@ -58,11 +61,99 @@ class AutoBridge:
 
         while True:
             try:
-                await self.process_visible_candidates()
+                if not self.backlog_complete and self._backlog_scan_enabled():
+                    await self.process_backlog_page()
+                else:
+                    await self.process_visible_candidates()
             except Exception as exc:
                 log_and_print(f"[AutoBridge] Read loop error: {exc}", "error")
                 log_and_print(traceback.format_exc(), "error")
             await asyncio.sleep(self._check_interval())
+
+    async def process_backlog_page(self):
+        self.viber.focus()
+        if not self.baseline_ready:
+            self.viber.scroll_to_bottom(self._setting_int("scroll_to_bottom_count", 3))
+            self.baseline_ready = True
+            log_and_print(
+                "[AutoBridge] Backlog scan started from bottom; will stop after "
+                f"{self._backlog_stop_after()} consecutive already delivered messages."
+            )
+
+        visible = self.collect_visible_candidates()
+        self.save_debug_screenshot("backlog_visible_scan")
+        if not visible:
+            log_and_print("[AutoBridge] Backlog page has no candidates; scrolling up.")
+            self.viber.scroll(amount=1, wheel_dist=5)
+            return
+
+        new_candidates = [
+            candidate for candidate in reversed(visible)
+            if candidate["signature"] not in self.backlog_scanned_signatures
+        ]
+        if not new_candidates:
+            log_and_print("[AutoBridge] Backlog page already scanned; scrolling up.")
+            self.viber.scroll(amount=1, wheel_dist=5)
+            cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
+            return
+
+        delay = self._read_delay()
+        log_and_print(
+            f"[AutoBridge] Backlog page queued: candidates={len(new_candidates)}, "
+            f"delay_before_copy={delay}s"
+        )
+        await asyncio.sleep(delay)
+
+        for candidate in new_candidates:
+            confirmed = self.find_visible_candidate_for_pending(candidate)
+            if not confirmed:
+                log_and_print(
+                    f"[AutoBridge] Backlog candidate disappeared before delayed read: "
+                    f"{candidate['signature']}",
+                    "warning",
+                )
+                self.backlog_scanned_signatures.add(candidate["signature"])
+                self.backlog_consecutive_delivered = 0
+                continue
+
+            message = self.copy_candidate_after_delay(confirmed)
+            self.backlog_scanned_signatures.add(candidate["signature"])
+            self.backlog_scanned_signatures.add(confirmed["signature"])
+
+            if not message:
+                self.backlog_consecutive_delivered = 0
+                continue
+
+            status = await self.deliver_message_with_registry(message)
+            if status == "already_delivered":
+                self.backlog_consecutive_delivered += 1
+                log_and_print(
+                    f"[AutoBridge] Backlog already-delivered streak: "
+                    f"{self.backlog_consecutive_delivered}/{self._backlog_stop_after()}"
+                )
+            else:
+                self.backlog_consecutive_delivered = 0
+
+            if status in ("already_delivered", "delivered_now"):
+                self.known_candidate_signatures.add(candidate["signature"])
+                self.known_candidate_signatures.add(confirmed["signature"])
+
+            if self.backlog_consecutive_delivered >= self._backlog_stop_after():
+                self.backlog_complete = True
+                self.pending_candidates.clear()
+                log_and_print(
+                    "[AutoBridge] Backlog scan complete: stop marker reached "
+                    f"({self.backlog_consecutive_delivered} consecutive already delivered messages)."
+                )
+                self.viber.scroll_to_bottom(self._setting_int("scroll_to_bottom_count", 3))
+                return
+
+        log_and_print(
+            f"[AutoBridge] Backlog page processed; scrolling up. "
+            f"already_delivered_streak={self.backlog_consecutive_delivered}"
+        )
+        self.viber.scroll(amount=self._setting_int("backlog_scroll_count", 1), wheel_dist=5)
+        cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
 
     async def process_visible_candidates(self):
         self.viber.focus()
@@ -190,14 +281,26 @@ class AutoBridge:
         return candidates
 
     async def send_message_with_registry(self, message):
+        return (await self.deliver_message_with_registry(message)) in ("already_delivered", "delivered_now")
+
+    async def deliver_message_with_registry(self, message):
         content_key = self.message_content_key(message)
         if not content_key:
             log_and_print(f"[AutoBridge] Cannot build registry key for message: {message}", "warning")
-            return False
+            return "failed"
 
         if self.sent_store.delivered_to_all(content_key, self.channel_names):
             log_and_print(f"[AutoBridge] Message already delivered to all targets: {content_key}")
-            return True
+            return "already_delivered"
+
+        if self.legacy_message_marked_sent(message):
+            log_and_print(
+                f"[AutoBridge] Message found in legacy sent registry; marking all targets delivered: {content_key}"
+            )
+            for channel_name in self.channel_names:
+                self.sent_store.mark_delivered(content_key, channel_name)
+                self.seen_store.mark_delivered(content_key, channel_name)
+            return "already_delivered"
 
         pending_targets = [
             channel_name for channel_name in self.channel_names
@@ -221,8 +324,17 @@ class AutoBridge:
 
         if self.sent_store.delivered_to_all(content_key, self.channel_names):
             self.mark_message_content_sent(message)
-            return True
+            return "delivered_now"
 
+        return "partial_failed"
+
+    def legacy_message_marked_sent(self, message):
+        if message["type"] == "text":
+            return self.sent_store.has_text(message.get("text", ""))
+        if message["type"] == "image":
+            return self.sent_store.has_image(message.get("image_hash"))
+        if message["type"] in ("file", "video", "voice"):
+            return self.sent_store.has_file(message.get("file_hash"))
         return False
 
     def message_content_key(self, message):
@@ -814,6 +926,12 @@ class AutoBridge:
 
     def _candidate_missing_tolerance(self):
         return self._setting_int("candidate_missing_tolerance", 4)
+
+    def _backlog_scan_enabled(self):
+        return bool(self.settings.get("backlog_scan_enabled", True))
+
+    def _backlog_stop_after(self):
+        return max(1, self._setting_int("backlog_stop_after_sent_count", 3))
 
     def _setting_int(self, name, default):
         try:
