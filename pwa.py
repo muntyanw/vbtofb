@@ -102,7 +102,17 @@ class AutoBridge:
             f"[AutoBridge] Backlog page queued: candidates={len(new_candidates)}, "
             f"delay_before_copy={delay}s"
         )
-        await asyncio.sleep(delay)
+        await self.wait_before_backlog_copy(delay)
+        visible_after_delay = self.collect_visible_candidates()
+        self.save_debug_screenshot("backlog_after_delay_scan")
+        visible_after_delay_signatures = {candidate["signature"] for candidate in visible_after_delay}
+        new_candidates = [
+            candidate for candidate in new_candidates
+            if candidate["signature"] in visible_after_delay_signatures
+        ]
+        log_and_print(
+            f"[AutoBridge] Backlog page rechecked after delay: still_visible={len(new_candidates)}"
+        )
 
         for candidate in new_candidates:
             confirmed = self.find_visible_candidate_for_pending(candidate)
@@ -154,6 +164,21 @@ class AutoBridge:
         )
         self.viber.scroll(amount=self._setting_int("backlog_scroll_count", 1), wheel_dist=5)
         cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
+
+    async def wait_before_backlog_copy(self, delay):
+        if delay <= 0:
+            return
+
+        step = max(1, self._setting_int("backlog_wait_log_interval_seconds", 10))
+        remaining = delay
+        while remaining > 0:
+            sleep_for = min(step, remaining)
+            log_and_print(
+                f"[AutoBridge] Backlog waiting before second scan/copy: "
+                f"{remaining}s remaining."
+            )
+            await asyncio.sleep(sleep_for)
+            remaining -= sleep_for
 
     async def process_visible_candidates(self):
         self.viber.focus()
