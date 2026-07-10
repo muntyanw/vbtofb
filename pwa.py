@@ -97,44 +97,29 @@ class AutoBridge:
             cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
             return
 
-        delay = self._read_delay()
         log_and_print(
-            f"[AutoBridge] Backlog page queued: candidates={len(new_candidates)}, "
-            f"delay_before_copy={delay}s"
-        )
-        await self.wait_before_backlog_copy(delay)
-        visible_after_delay = self.collect_visible_candidates()
-        self.save_debug_screenshot("backlog_after_delay_scan")
-        visible_after_delay_signatures = {candidate["signature"] for candidate in visible_after_delay}
-        new_candidates = [
-            candidate for candidate in new_candidates
-            if candidate["signature"] in visible_after_delay_signatures
-        ]
-        log_and_print(
-            f"[AutoBridge] Backlog page rechecked after delay: still_visible={len(new_candidates)}"
+            f"[AutoBridge] Backlog page queued for immediate registry check: "
+            f"candidates={len(new_candidates)}"
         )
 
         for candidate in new_candidates:
             confirmed = self.find_visible_candidate_for_pending(candidate)
             if not confirmed:
                 log_and_print(
-                    f"[AutoBridge] Backlog candidate disappeared before delayed read: "
+                    f"[AutoBridge] Backlog candidate disappeared before registry check: "
                     f"{candidate['signature']}",
                     "warning",
                 )
-                self.backlog_scanned_signatures.add(candidate["signature"])
                 self.backlog_consecutive_delivered = 0
                 continue
 
             message = self.copy_candidate_after_delay(confirmed)
-            self.backlog_scanned_signatures.add(candidate["signature"])
-            self.backlog_scanned_signatures.add(confirmed["signature"])
 
             if not message:
                 self.backlog_consecutive_delivered = 0
                 continue
 
-            status = await self.deliver_message_with_registry(message)
+            status = self.message_registry_status(message)
             if status == "already_delivered":
                 self.backlog_consecutive_delivered += 1
                 log_and_print(
@@ -143,8 +128,11 @@ class AutoBridge:
                 )
             else:
                 self.backlog_consecutive_delivered = 0
+                status = await self.wait_and_deliver_backlog_candidate(candidate)
 
             if status in ("already_delivered", "delivered_now"):
+                self.backlog_scanned_signatures.add(candidate["signature"])
+                self.backlog_scanned_signatures.add(confirmed["signature"])
                 self.known_candidate_signatures.add(candidate["signature"])
                 self.known_candidate_signatures.add(confirmed["signature"])
 
@@ -164,6 +152,30 @@ class AutoBridge:
         )
         self.viber.scroll(amount=self._setting_int("backlog_scroll_count", 1), wheel_dist=5)
         cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
+
+    async def wait_and_deliver_backlog_candidate(self, candidate):
+        delay = self._read_delay()
+        log_and_print(
+            f"[AutoBridge] Backlog candidate is not delivered yet; "
+            f"waiting {delay}s before second scan/send: {candidate['signature']}"
+        )
+        await self.wait_before_backlog_copy(delay)
+
+        confirmed = self.find_visible_candidate_for_pending(candidate)
+        self.save_debug_screenshot("backlog_after_delay_scan")
+        if not confirmed:
+            log_and_print(
+                f"[AutoBridge] Backlog candidate not found after delay; will retry on later scan: "
+                f"{candidate['signature']}",
+                "warning",
+            )
+            return "failed"
+
+        message = self.copy_candidate_after_delay(confirmed)
+        if not message:
+            return "failed"
+
+        return await self.deliver_message_with_registry(message)
 
     async def wait_before_backlog_copy(self, delay):
         if delay <= 0:
@@ -308,14 +320,13 @@ class AutoBridge:
     async def send_message_with_registry(self, message):
         return (await self.deliver_message_with_registry(message)) in ("already_delivered", "delivered_now")
 
-    async def deliver_message_with_registry(self, message):
+    def message_registry_status(self, message):
         content_key = self.message_content_key(message)
         if not content_key:
             log_and_print(f"[AutoBridge] Cannot build registry key for message: {message}", "warning")
             return "failed"
 
         if self.sent_store.delivered_to_all(content_key, self.channel_names):
-            log_and_print(f"[AutoBridge] Message already delivered to all targets: {content_key}")
             return "already_delivered"
 
         if self.legacy_message_marked_sent(message):
@@ -325,6 +336,19 @@ class AutoBridge:
             for channel_name in self.channel_names:
                 self.sent_store.mark_delivered(content_key, channel_name)
                 self.seen_store.mark_delivered(content_key, channel_name)
+            return "already_delivered"
+
+        return "pending"
+
+    async def deliver_message_with_registry(self, message):
+        content_key = self.message_content_key(message)
+        if not content_key:
+            log_and_print(f"[AutoBridge] Cannot build registry key for message: {message}", "warning")
+            return "failed"
+
+        registry_status = self.message_registry_status(message)
+        if registry_status == "already_delivered":
+            log_and_print(f"[AutoBridge] Message already delivered to all targets: {content_key}")
             return "already_delivered"
 
         pending_targets = [
