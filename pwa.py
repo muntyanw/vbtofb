@@ -46,6 +46,8 @@ class AutoBridge:
         self.backlog_processed_content_keys = set()
         self.backlog_consecutive_delivered = 0
         self.backlog_complete = False
+        self.backlog_cycle_active = False
+        self.backlog_cycle_number = 0
         self.debug_dir = Path(settings.get("debug_screenshot_dir", "runtime_debug"))
         self.debug_screenshots = bool(settings.get("debug_screenshots_enabled", True))
         self.shot_index = 0
@@ -63,7 +65,9 @@ class AutoBridge:
 
         while True:
             try:
-                if not self.backlog_complete and self._backlog_scan_enabled():
+                if self._backlog_scan_enabled():
+                    if not self.backlog_cycle_active:
+                        self.start_backlog_scan_cycle()
                     await self.process_backlog_page()
                 else:
                     await self.process_visible_candidates()
@@ -74,13 +78,8 @@ class AutoBridge:
 
     async def process_backlog_page(self):
         self.viber.focus()
-        if not self.baseline_ready:
-            self.viber.scroll_to_bottom(self._setting_int("scroll_to_bottom_count", 3))
-            self.baseline_ready = True
-            log_and_print(
-                "[AutoBridge] Backlog scan started from bottom; will stop after "
-                f"{self._backlog_stop_after()} consecutive already delivered messages."
-            )
+        if not self.backlog_cycle_active:
+            self.start_backlog_scan_cycle()
 
         visible = self.collect_visible_candidates()
         self.save_debug_screenshot("backlog_visible_scan")
@@ -106,17 +105,7 @@ class AutoBridge:
 
         page_content_keys = set()
         for candidate in new_candidates:
-            confirmed = self.find_visible_candidate_for_pending(candidate)
-            if not confirmed:
-                log_and_print(
-                    f"[AutoBridge] Backlog candidate disappeared before registry check: "
-                    f"{candidate['signature']}",
-                    "warning",
-                )
-                self.backlog_consecutive_delivered = 0
-                continue
-
-            message = self.copy_candidate_after_delay(confirmed)
+            message = self.copy_candidate_after_delay(candidate)
 
             if not message:
                 self.backlog_consecutive_delivered = 0
@@ -133,7 +122,6 @@ class AutoBridge:
                     f"[AutoBridge] Backlog duplicate candidate for already handled content skipped: {content_key}"
                 )
                 self.backlog_scanned_signatures.add(candidate["signature"])
-                self.backlog_scanned_signatures.add(confirmed["signature"])
                 continue
             page_content_keys.add(content_key)
 
@@ -151,12 +139,11 @@ class AutoBridge:
             if status in ("already_delivered", "delivered_now"):
                 self.backlog_processed_content_keys.add(content_key)
                 self.backlog_scanned_signatures.add(candidate["signature"])
-                self.backlog_scanned_signatures.add(confirmed["signature"])
                 self.known_candidate_signatures.add(candidate["signature"])
-                self.known_candidate_signatures.add(confirmed["signature"])
 
             if self.backlog_consecutive_delivered >= self._backlog_stop_after():
                 self.backlog_complete = True
+                self.backlog_cycle_active = False
                 self.pending_candidates.clear()
                 log_and_print(
                     "[AutoBridge] Backlog scan complete: stop marker reached "
@@ -171,6 +158,22 @@ class AutoBridge:
         )
         self.viber.scroll(amount=self._setting_int("backlog_scroll_count", 1), wheel_dist=5)
         cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
+
+    def start_backlog_scan_cycle(self):
+        self.viber.focus()
+        self.viber.scroll_to_bottom(self._setting_int("scroll_to_bottom_count", 3))
+        self.baseline_ready = True
+        self.backlog_cycle_active = True
+        self.backlog_complete = False
+        self.backlog_cycle_number += 1
+        self.backlog_scanned_signatures.clear()
+        self.backlog_processed_content_keys.clear()
+        self.backlog_consecutive_delivered = 0
+        log_and_print(
+            "[AutoBridge] Backlog scan cycle started from bottom: "
+            f"cycle={self.backlog_cycle_number}, stop_after={self._backlog_stop_after()} "
+            "consecutive already delivered messages."
+        )
 
     async def wait_and_deliver_backlog_candidate(self, candidate):
         delay = self._read_delay()
