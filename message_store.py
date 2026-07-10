@@ -11,6 +11,7 @@ class MessageStore:
         self.text_hashes = deque(maxlen=max_items)
         self.image_hashes = deque(maxlen=max_items)
         self.file_hashes = deque(maxlen=max_items)
+        self.deliveries = {}
         self.load()
 
     def load(self):
@@ -26,12 +27,14 @@ class MessageStore:
         self.text_hashes = deque(data.get("text_hashes", []), maxlen=self.max_items)
         self.image_hashes = deque(data.get("image_hashes", []), maxlen=self.max_items)
         self.file_hashes = deque(data.get("file_hashes", []), maxlen=self.max_items)
+        self.deliveries = data.get("deliveries", {})
 
     def save(self):
         data = {
             "text_hashes": list(self.text_hashes),
             "image_hashes": list(self.image_hashes),
             "file_hashes": list(self.file_hashes),
+            "deliveries": self.deliveries,
         }
         with open(self.path, "w", encoding="utf-8") as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
@@ -85,6 +88,29 @@ class MessageStore:
     def has_file(self, file_hash):
         return bool(file_hash and file_hash in self.file_hashes)
 
+    def mark_delivered(self, content_key, target):
+        if not content_key or target is None:
+            return False
+        target_key = normalize_target_key(target)
+        targets = set(self.deliveries.get(content_key, []))
+        if target_key in targets:
+            return False
+        targets.add(target_key)
+        self.deliveries[content_key] = sorted(targets)
+        self.save()
+        return True
+
+    def has_delivery(self, content_key, target):
+        if not content_key or target is None:
+            return False
+        return normalize_target_key(target) in set(self.deliveries.get(content_key, []))
+
+    def delivered_to_all(self, content_key, targets):
+        if not targets:
+            return False
+        delivered = set(self.deliveries.get(content_key, []))
+        return all(normalize_target_key(target) in delivered for target in targets)
+
 
 def normalize_text(text):
     if not text:
@@ -107,3 +133,7 @@ def hash_file(path, chunk_size=1024 * 1024):
         for chunk in iter(lambda: file.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def normalize_target_key(target):
+    return str(target).strip()

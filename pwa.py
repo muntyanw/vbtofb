@@ -16,7 +16,7 @@ from PIL import Image, ImageGrab
 
 from init import init as load_config
 from log import log_and_print
-from message_store import MessageStore, hash_file, normalize_text
+from message_store import MessageStore, hash_file, hash_text, normalize_text
 from recognize_text import capture_and_find_multiple_text_coordinates
 from tg import startTgClient
 from vb_utils import process_one_message, reformat_telegram_text
@@ -71,13 +71,11 @@ class AutoBridge:
         visible = self.collect_visible_candidates()
         self.save_debug_screenshot("visible_scan")
         if not self.baseline_ready:
-            self.known_candidate_signatures = {candidate["signature"] for candidate in visible}
             self.baseline_ready = True
             log_and_print(
-                "[AutoBridge] Baseline captured; existing visible messages will not be sent: "
-                f"{len(self.known_candidate_signatures)}"
+                "[AutoBridge] Startup scan captured; visible messages will be checked "
+                f"against delivery registry after delay: {len(visible)}"
             )
-            return
 
         if not visible:
             self.pending_candidates.clear()
@@ -159,36 +157,9 @@ class AutoBridge:
             if not message:
                 continue
 
-            if message["type"] == "text" and self.sent_store.has_text(message["text"]):
-                log_and_print("[AutoBridge] Text already sent before, skipping duplicate.")
+            if await self.send_message_with_registry(message):
                 self.known_candidate_signatures.add(signature)
                 self.known_candidate_signatures.add(confirmed["signature"])
-            elif message["type"] == "text":
-                if await self.send_text(message["text"]):
-                    self.sent_store.mark_text(message["text"])
-                    self.seen_store.mark_text(message["text"])
-                    self.known_candidate_signatures.add(signature)
-                    self.known_candidate_signatures.add(confirmed["signature"])
-            elif message["type"] == "image" and self.sent_store.has_image(message["image_hash"]):
-                log_and_print("[AutoBridge] Image already sent before, skipping duplicate.")
-                self.known_candidate_signatures.add(signature)
-                self.known_candidate_signatures.add(confirmed["signature"])
-            elif message["type"] == "image":
-                if await self.send_image(message["image"], message["image_hash"]):
-                    self.sent_store.mark_image(message["image_hash"])
-                    self.seen_store.mark_image(message["image_hash"])
-                    self.known_candidate_signatures.add(signature)
-                    self.known_candidate_signatures.add(confirmed["signature"])
-            elif message["type"] == "video":
-                if self.sent_store.has_file(message["file_hash"]):
-                    log_and_print("[AutoBridge] Video already sent before, skipping duplicate.")
-                    self.known_candidate_signatures.add(signature)
-                    self.known_candidate_signatures.add(confirmed["signature"])
-                elif await self.send_video(message["file_path"], message["file_hash"]):
-                    self.sent_store.mark_file(message["file_hash"])
-                    self.seen_store.mark_file(message["file_hash"])
-                    self.known_candidate_signatures.add(signature)
-                    self.known_candidate_signatures.add(confirmed["signature"])
 
     def collect_visible_candidates(self):
         region = self.viber.messages_region()
@@ -217,6 +188,85 @@ class AutoBridge:
         log_and_print(f"[AutoBridge] Visible candidates found: {len(candidates)}")
         self.write_debug_json("visible_candidates", candidates)
         return candidates
+
+    async def send_message_with_registry(self, message):
+        content_key = self.message_content_key(message)
+        if not content_key:
+            log_and_print(f"[AutoBridge] Cannot build registry key for message: {message}", "warning")
+            return False
+
+        if self.sent_store.delivered_to_all(content_key, self.channel_names):
+            log_and_print(f"[AutoBridge] Message already delivered to all targets: {content_key}")
+            return True
+
+        pending_targets = [
+            channel_name for channel_name in self.channel_names
+            if not self.sent_store.has_delivery(content_key, channel_name)
+        ]
+        log_and_print(
+            f"[AutoBridge] Delivery check: key={content_key}, "
+            f"pending_targets={pending_targets}"
+        )
+
+        for channel_name in pending_targets:
+            sent = await self.send_one_message_to_target(message, channel_name)
+            if sent:
+                self.sent_store.mark_delivered(content_key, channel_name)
+                self.seen_store.mark_delivered(content_key, channel_name)
+            else:
+                log_and_print(
+                    f"[AutoBridge] Send failed; will retry later: key={content_key}, target={channel_name}",
+                    "warning",
+                )
+
+        if self.sent_store.delivered_to_all(content_key, self.channel_names):
+            self.mark_message_content_sent(message)
+            return True
+
+        return False
+
+    def message_content_key(self, message):
+        if message["type"] == "text":
+            return f"text:{hash_text(message.get('text', ''))}"
+        if message["type"] == "image":
+            return f"image:{message.get('image_hash')}"
+        if message["type"] in ("file", "video", "voice"):
+            return f"file:{message.get('file_hash')}"
+        return None
+
+    def mark_message_content_sent(self, message):
+        if message["type"] == "text":
+            self.sent_store.mark_text(message["text"])
+            self.seen_store.mark_text(message["text"])
+        elif message["type"] == "image":
+            self.sent_store.mark_image(message["image_hash"])
+            self.seen_store.mark_image(message["image_hash"])
+        elif message["type"] in ("file", "video", "voice"):
+            self.sent_store.mark_file(message["file_hash"])
+            self.seen_store.mark_file(message["file_hash"])
+
+    async def send_one_message_to_target(self, message, channel_name):
+        if message["type"] == "text":
+            log_and_print(f"[AutoBridge] Sending text to Telegram target {channel_name}: {message['text']}")
+            return await process_one_message(message["text"], self.bot_client, channel_name, self.name_viber, None)
+
+        if message["type"] == "image":
+            bio = BytesIO()
+            bio.name = f"{message['image_hash']}.png"
+            message["image"].save(bio, "PNG")
+            bio.seek(0)
+            log_and_print(f"[AutoBridge] Sending image to Telegram target {channel_name}: {bio.name}")
+            return await process_one_message("", self.bot_client, channel_name, self.name_viber, bio)
+
+        if message["type"] in ("file", "video", "voice"):
+            log_and_print(
+                f"[AutoBridge] Sending file to Telegram target {channel_name}: "
+                f"{message['file_path']}, hash={message['file_hash']}"
+            )
+            return await process_one_message("", self.bot_client, channel_name, self.name_viber, message["file_path"])
+
+        log_and_print(f"[AutoBridge] Unsupported message type for send: {message}", "warning")
+        return False
 
     def find_visible_candidate_for_pending(self, pending):
         self.viber.focus()
@@ -267,19 +317,11 @@ class AutoBridge:
         self.save_debug_screenshot("before_delayed_copy")
         current_hash = self.screen_patch_hash(x, y)
         if current_hash != candidate["visual_hash"]:
-            if expected_type == "video":
-                log_and_print(
-                    f"[AutoBridge] Video candidate patch changed before read; continuing with menu recheck. "
-                    f"key={candidate['key']}, old_hash={candidate['visual_hash']}, new_hash={current_hash}",
-                    "warning",
-                )
-            else:
-                log_and_print(
-                    f"[AutoBridge] Candidate patch changed before read; aborting this copy attempt. "
-                    f"key={candidate['key']}, old_hash={candidate['visual_hash']}, new_hash={current_hash}",
-                    "warning",
-                )
-                return None
+            log_and_print(
+                f"[AutoBridge] Candidate patch changed before read; continuing with menu recheck. "
+                f"key={candidate['key']}, old_hash={candidate['visual_hash']}, new_hash={current_hash}",
+                "warning",
+            )
 
         pyperclip.copy("")
         self.viber.click_in_messages(x, y, button="right")
@@ -298,8 +340,16 @@ class AutoBridge:
             self.close_context_menu(x, y)
             return None
 
-        if action == "video":
-            return self.copy_video_after_select(candidate, menu_region, menu_items)
+        if menu_items.get("isSelect"):
+            return self.copy_selected_message(candidate, menu_region, menu_items, action)
+
+        if action in ("file", "link"):
+            self.close_context_menu(x, y)
+            log_and_print(
+                f"[AutoBridge] {action} message has no Select item; cannot safely copy via buffer.",
+                "warning",
+            )
+            return None
 
         menu_key = self.menu_key_for_action(action, menu_items)
         self.click_menu_item(menu_region, menu_items[menu_key])
@@ -326,6 +376,117 @@ class AutoBridge:
 
         log_and_print(f"[AutoBridge] Clipboard did not contain expected data for action={action}.", "warning")
         return None
+
+    def copy_selected_message(self, candidate, menu_region, menu_items, expected_type):
+        x = candidate["x"]
+        y = candidate["y"]
+        select_rect = menu_items.get("isSelect")
+        if not select_rect:
+            log_and_print(f"[AutoBridge] Menu has no Select item; items={menu_items}", "warning")
+            self.close_context_menu(x, y)
+            return None
+
+        log_and_print(f"[AutoBridge] Selecting message before copy: expected_type={expected_type}")
+        self.click_menu_item(menu_region, select_rect)
+        cv2.waitKey(self._setting_int("select_wait_ms", self._setting_int("video_select_wait_ms", 500)))
+        self.save_debug_screenshot("message_selected")
+
+        pyperclip.copy("")
+        self.viber.click_in_messages(x, y, button="right")
+        cv2.waitKey(self._setting_int("context_menu_open_delay_ms", 350))
+        self.save_debug_screenshot("selected_copy_context_menu")
+
+        copy_menu_region = self.menu_region_around(x, y)
+        copy_menu_items = self.read_context_menu(copy_menu_region)
+        log_and_print(f"[AutoBridge] Selected copy menu items: {copy_menu_items}")
+        copy_rect = copy_menu_items.get("isCopy")
+        if not copy_rect:
+            self.close_context_menu(x, y)
+            log_and_print(
+                "[AutoBridge] Selected message copy menu has no Copy item; trying Ctrl+C fallback.",
+                "warning",
+            )
+            pyautogui.hotkey("ctrl", "c")
+            cv2.waitKey(self._setting_int("selected_clipboard_wait_ms", self._setting_int("clipboard_wait_ms", 700)))
+            self.save_debug_screenshot("after_selected_ctrl_c")
+            message = self.message_from_clipboard(expected_type)
+            if message:
+                return message
+
+            if expected_type in ("file", "video", "voice"):
+                paths = self.reveal_file_from_viber(candidate)
+                return self.message_from_file_paths(paths)
+
+            return None
+
+        self.click_menu_item(copy_menu_region, copy_rect)
+        cv2.waitKey(self._setting_int("selected_clipboard_wait_ms", self._setting_int("clipboard_wait_ms", 700)))
+        self.save_debug_screenshot("after_selected_copy")
+
+        message = self.message_from_clipboard(expected_type)
+        if message:
+            return message
+
+        if expected_type in ("file", "video", "voice"):
+            log_and_print(
+                "[AutoBridge] Clipboard did not contain file paths after selected Copy; "
+                "trying Show in folder fallback.",
+                "warning",
+            )
+            paths = self.reveal_file_from_viber(candidate)
+            return self.message_from_file_paths(paths)
+
+        log_and_print(f"[AutoBridge] Clipboard did not contain expected selected data: {expected_type}", "warning")
+        return None
+
+    def message_from_clipboard(self, expected_type=None):
+        paths = self.read_clipboard_file_paths()
+        file_message = self.message_from_file_paths(paths)
+        if file_message:
+            return file_message
+
+        image = ImageGrab.grabclipboard()
+        if isinstance(image, Image.Image):
+            image_hash = hash_image(image)
+            log_and_print(f"[AutoBridge] Clipboard image copied: size={image.size}, hash={image_hash}")
+            return {
+                "type": "image",
+                "image": image,
+                "image_hash": image_hash,
+                "key": f"image:{image_hash}",
+            }
+
+        if expected_type in ("file", "video", "voice"):
+            log_and_print(
+                f"[AutoBridge] Clipboard has no file/image data for expected {expected_type}.",
+                "warning",
+            )
+            return None
+
+        clipboard_text = repair_clipboard_text(pyperclip.paste())
+        text = normalize_text(reformat_telegram_text(clipboard_text))
+        if text:
+            log_and_print(f"[AutoBridge] Clipboard text copied: chars={len(text)}")
+            return {"type": "text", "text": text, "key": f"text:{text}"}
+
+        return None
+
+    def message_from_file_paths(self, paths):
+        file_path = self.choose_sendable_file(paths)
+        if not file_path:
+            return None
+
+        file_digest = hash_file(file_path)
+        file_size = Path(file_path).stat().st_size
+        log_and_print(
+            f"[AutoBridge] Clipboard file copied: path={file_path}, size={file_size}, hash={file_digest}"
+        )
+        return {
+            "type": "file",
+            "file_path": file_path,
+            "file_hash": file_digest,
+            "key": f"file:{file_digest}",
+        }
 
     def copy_video_after_select(self, candidate, menu_region, menu_items):
         x = candidate["x"]
@@ -389,6 +550,9 @@ class AutoBridge:
         }
 
     def reveal_video_file_from_viber(self, candidate):
+        return self.reveal_file_from_viber(candidate)
+
+    def reveal_file_from_viber(self, candidate):
         x = candidate["x"]
         y = candidate["y"]
 
@@ -413,7 +577,7 @@ class AutoBridge:
         cv2.waitKey(self._setting_int("video_folder_clipboard_wait_ms", 500))
         paths = self.read_clipboard_file_paths()
         if not paths:
-            recent = self.find_recent_downloaded_video()
+            recent = self.find_recent_downloaded_file()
             if recent:
                 paths = [recent]
 
@@ -425,17 +589,18 @@ class AutoBridge:
         return paths
 
     def find_recent_downloaded_video(self):
+        return self.find_recent_downloaded_file()
+
+    def find_recent_downloaded_file(self):
         root = Path(self.settings.get("path_files_downloads", "") or "")
         if not root.exists():
             return None
 
-        video_extensions = {
-            ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp", ".wmv",
-        }
+        sendable_extensions = self.sendable_file_extensions()
         newest = None
         for path in root.rglob("*"):
             try:
-                if not path.is_file() or path.suffix.lower() not in video_extensions:
+                if not path.is_file() or path.suffix.lower() not in sendable_extensions:
                     continue
                 if newest is None or path.stat().st_mtime > newest.stat().st_mtime:
                     newest = path
@@ -443,7 +608,7 @@ class AutoBridge:
                 continue
 
         if newest:
-            log_and_print(f"[AutoBridge] Recent downloaded video fallback: {newest}")
+            log_and_print(f"[AutoBridge] Recent downloaded file fallback: {newest}")
             return str(newest)
         return None
 
@@ -473,16 +638,24 @@ class AutoBridge:
         return paths
 
     def choose_video_file(self, paths):
-        video_extensions = {
-            ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp", ".wmv",
-        }
+        return self.choose_sendable_file(paths)
+
+    def choose_sendable_file(self, paths):
+        sendable_extensions = self.sendable_file_extensions()
         existing = [Path(path) for path in paths if Path(path).is_file()]
         for path in existing:
-            if path.suffix.lower() in video_extensions:
+            if path.suffix.lower() in sendable_extensions:
                 return str(path)
         if existing:
             return str(existing[0])
         return None
+
+    def sendable_file_extensions(self):
+        return {
+            ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp", ".wmv",
+            ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".amr",
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar", ".7z",
+        }
 
     def save_debug_screenshot(self, label):
         if not self.debug_screenshots:
@@ -525,6 +698,7 @@ class AutoBridge:
         search_phrases.setdefault("isPhotoWord", ["фото", "фот"])
         search_phrases.setdefault("isShowInFolder", ["Показать в папке"])
         search_phrases.setdefault("isSelect", ["Выбрать"])
+        search_phrases.setdefault("isOpenInBrowser", ["Открыть в браузере"])
         menu_items = capture_and_find_multiple_text_coordinates(
             menu_region,
             search_phrases,
@@ -538,9 +712,11 @@ class AutoBridge:
         if menu_items.get("isCopy") and menu_items.get("isPhotoWord"):
             return "image"
         if menu_items.get("isShowInFolder"):
-            return "video"
+            return "file"
+        if menu_items.get("isOpenInBrowser"):
+            return "link"
         if menu_items.get("isVideo"):
-            return "video"
+            return "file"
         if menu_items.get("isText"):
             return "text"
         if menu_items.get("isCopy"):
@@ -554,18 +730,24 @@ class AutoBridge:
             return True
         if actual == "copy" and expected in ("text", "image", "copy"):
             return True
+        if expected == "link" and actual in ("link", "text", "copy"):
+            return True
+        if expected in ("file", "video", "voice") and actual in ("file", "video", "voice"):
+            return True
         return False
 
     def menu_key_for_action(self, action, menu_items):
         preferred_key = {
             "text": "isText",
             "image": "isImage",
+            "file": "isShowInFolder",
+            "link": "isOpenInBrowser",
             "video": "isShowInFolder",
             "copy": "isCopy",
         }[action]
         if menu_items.get(preferred_key):
             return preferred_key
-        if action == "video" and menu_items.get("isVideo"):
+        if action in ("file", "video", "voice") and menu_items.get("isVideo"):
             return "isVideo"
         if action in ("text", "image", "copy") and menu_items.get("isCopy"):
             return "isCopy"
@@ -643,6 +825,31 @@ class AutoBridge:
 def hash_image(image):
     small = image.convert("L").resize((16, 16), Image.Resampling.LANCZOS)
     return hashlib.sha256(small.tobytes()).hexdigest()
+
+
+def repair_clipboard_text(text):
+    if not text:
+        return text
+
+    try:
+        repaired = text.encode("cp1251").decode("utf-8")
+    except UnicodeError:
+        return text
+
+    if mojibake_score(text) >= 3 and mojibake_score(repaired) < mojibake_score(text):
+        log_and_print("[AutoBridge] Clipboard text encoding repaired from cp1251 mojibake.")
+        return repaired
+    return text
+
+
+def mojibake_score(text):
+    markers = (
+        "Р°", "Р±", "РІ", "Рі", "Рґ", "Рµ", "Р¶", "Р·", "Рё", "Р№",
+        "Рє", "Р»", "Рј", "РЅ", "Рѕ", "Рї", "СЂ", "СЃ", "С‚", "Сѓ",
+        "С„", "С…", "С†", "С‡", "С€", "С‰", "СЊ", "С‹", "СЌ", "СЋ",
+        "СЏ", "С–", "С—", "С”", "С‘", "С™", "рџ",
+    )
+    return sum(text.count(marker) for marker in markers)
 
 
 async def main():
