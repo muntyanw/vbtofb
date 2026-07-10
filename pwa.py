@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import re
 import time
 import traceback
 from datetime import datetime
@@ -397,7 +398,7 @@ class AutoBridge:
 
     def legacy_message_marked_sent(self, message):
         if message["type"] == "text":
-            return self.sent_store.has_text(message.get("text", ""))
+            return any(self.sent_store.has_text(text) for text in self.text_registry_variants(message.get("text", "")))
         if message["type"] == "image":
             return self.sent_store.has_image(message.get("image_hash"))
         if message["type"] in ("file", "video", "voice"):
@@ -406,7 +407,7 @@ class AutoBridge:
 
     def message_content_key(self, message):
         if message["type"] == "text":
-            return f"text:{hash_text(message.get('text', ''))}"
+            return f"text:{hash_text(self.canonical_text_for_registry(message.get('text', '')))}"
         if message["type"] == "image":
             return f"image:{message.get('image_hash')}"
         if message["type"] in ("file", "video", "voice"):
@@ -415,14 +416,30 @@ class AutoBridge:
 
     def mark_message_content_sent(self, message):
         if message["type"] == "text":
-            self.sent_store.mark_text(message["text"])
-            self.seen_store.mark_text(message["text"])
+            for text in self.text_registry_variants(message["text"]):
+                self.sent_store.mark_text(text)
+                self.seen_store.mark_text(text)
         elif message["type"] == "image":
             self.sent_store.mark_image(message["image_hash"])
             self.seen_store.mark_image(message["image_hash"])
         elif message["type"] in ("file", "video", "voice"):
             self.sent_store.mark_file(message["file_hash"])
             self.seen_store.mark_file(message["file_hash"])
+
+    def canonical_text_for_registry(self, text):
+        variants = self.text_registry_variants(text)
+        return variants[-1] if variants else ""
+
+    def text_registry_variants(self, text):
+        normalized = normalize_text(text)
+        if not normalized:
+            return []
+
+        variants = [normalized]
+        without_header = strip_viber_text_header(normalized)
+        if without_header and without_header not in variants:
+            variants.append(without_header)
+        return variants
 
     async def send_one_message_to_target(self, message, channel_name):
         if message["type"] == "text":
@@ -1025,6 +1042,19 @@ def repair_clipboard_text(text):
         log_and_print("[AutoBridge] Clipboard text encoding repaired from cp1251 mojibake.")
         return repaired
     return text
+
+
+def strip_viber_text_header(text):
+    normalized = normalize_text(text)
+    if not normalized.startswith("["):
+        return normalized
+
+    # Viber selected-copy text usually starts with:
+    # [ weekday, date time ] sender: message body
+    match = re.match(r"^\[[^\]]+\]\s*[^\n:]{1,120}:\s*(.*)$", normalized, flags=re.DOTALL)
+    if match:
+        return normalize_text(match.group(1))
+    return normalized
 
 
 def mojibake_score(text):
