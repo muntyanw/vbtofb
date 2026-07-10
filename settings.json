@@ -50,7 +50,11 @@
         "right_padding": 18,
         "top_padding": 0,
         "bottom_padding": 0,
-        "scan_step_px": 130,
+        "scan_step_px": 80,
+        "scan_step_offsets_px": [
+            0,
+            40
+        ],
         "scan_top_skip_px": 18,
         "scan_bottom_skip_px": 12,
         "message_click_x_ratio": 0.22,
@@ -59,6 +63,7 @@
             0.34
         ]
     },
+    "marker_send_down_scroll_count": 3,
     "context_menu": {
         "width": 260,
         "height": 260,
