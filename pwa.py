@@ -42,6 +42,7 @@ class AutoBridge:
         self.known_candidate_signatures = set()
         self.baseline_ready = False
         self.backlog_scanned_signatures = set()
+        self.backlog_processed_content_keys = set()
         self.backlog_consecutive_delivered = 0
         self.backlog_complete = False
         self.debug_dir = Path(settings.get("debug_screenshot_dir", "runtime_debug"))
@@ -102,6 +103,7 @@ class AutoBridge:
             f"candidates={len(new_candidates)}"
         )
 
+        page_content_keys = set()
         for candidate in new_candidates:
             confirmed = self.find_visible_candidate_for_pending(candidate)
             if not confirmed:
@@ -119,6 +121,21 @@ class AutoBridge:
                 self.backlog_consecutive_delivered = 0
                 continue
 
+            content_key = self.message_content_key(message)
+            if not content_key:
+                log_and_print(f"[AutoBridge] Backlog cannot build content key, skipping: {message}", "warning")
+                self.backlog_consecutive_delivered = 0
+                continue
+
+            if content_key in page_content_keys or content_key in self.backlog_processed_content_keys:
+                log_and_print(
+                    f"[AutoBridge] Backlog duplicate candidate for already handled content skipped: {content_key}"
+                )
+                self.backlog_scanned_signatures.add(candidate["signature"])
+                self.backlog_scanned_signatures.add(confirmed["signature"])
+                continue
+            page_content_keys.add(content_key)
+
             status = self.message_registry_status(message)
             if status == "already_delivered":
                 self.backlog_consecutive_delivered += 1
@@ -131,6 +148,7 @@ class AutoBridge:
                 status = await self.wait_and_deliver_backlog_candidate(candidate)
 
             if status in ("already_delivered", "delivered_now"):
+                self.backlog_processed_content_keys.add(content_key)
                 self.backlog_scanned_signatures.add(candidate["signature"])
                 self.backlog_scanned_signatures.add(confirmed["signature"])
                 self.known_candidate_signatures.add(candidate["signature"])
