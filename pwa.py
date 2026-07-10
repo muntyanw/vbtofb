@@ -48,6 +48,13 @@ class AutoBridge:
         self.backlog_complete = False
         self.backlog_cycle_active = False
         self.backlog_cycle_number = 0
+        self.marker_cycle_phase = "idle"
+        self.marker_cycle_pause_until = 0
+        self.marker_cycle_marker_y = None
+        self.marker_cycle_find_pages = 0
+        self.marker_cycle_last_down_signature = None
+        self.marker_cycle_sent_keys = set()
+        self.marker_cycle_message_cache = {}
         self.debug_dir = Path(settings.get("debug_screenshot_dir", "runtime_debug"))
         self.debug_screenshots = bool(settings.get("debug_screenshots_enabled", True))
         self.shot_index = 0
@@ -66,15 +73,206 @@ class AutoBridge:
         while True:
             try:
                 if self._backlog_scan_enabled():
-                    if not self.backlog_cycle_active:
-                        self.start_backlog_scan_cycle()
-                    await self.process_backlog_page()
+                    await self.process_marker_cycle()
                 else:
                     await self.process_visible_candidates()
             except Exception as exc:
                 log_and_print(f"[AutoBridge] Read loop error: {exc}", "error")
                 log_and_print(traceback.format_exc(), "error")
             await asyncio.sleep(self._check_interval())
+
+    async def process_marker_cycle(self):
+        now = time.monotonic()
+        if self.marker_cycle_phase == "paused":
+            remaining = self.marker_cycle_pause_until - now
+            if remaining > 0:
+                log_and_print(f"[AutoBridge] Cycle pause before next scan: {remaining:.1f}s remaining.")
+                return
+            self.start_marker_cycle()
+
+        if self.marker_cycle_phase == "idle":
+            self.start_marker_cycle()
+
+        if self.marker_cycle_phase == "find_marker_up":
+            await self.find_sent_marker_up()
+        elif self.marker_cycle_phase == "send_down":
+            await self.send_pending_down_page()
+
+    def start_marker_cycle(self):
+        self.viber.focus()
+        self.viber.scroll_to_bottom(self._setting_int("scroll_to_bottom_count", 3))
+        self.baseline_ready = True
+        self.backlog_cycle_number += 1
+        self.marker_cycle_phase = "find_marker_up"
+        self.marker_cycle_marker_y = None
+        self.marker_cycle_find_pages = 0
+        self.marker_cycle_last_down_signature = None
+        self.marker_cycle_sent_keys.clear()
+        self.marker_cycle_message_cache.clear()
+        self.backlog_scanned_signatures.clear()
+        self.backlog_processed_content_keys.clear()
+        log_and_print(
+            "[AutoBridge] Marker cycle started from bottom without startup wait: "
+            f"cycle={self.backlog_cycle_number}"
+        )
+
+    async def find_sent_marker_up(self):
+        self.viber.focus()
+        visible = self.collect_visible_candidates()
+        self.save_debug_screenshot("marker_find_up")
+        self.marker_cycle_find_pages += 1
+
+        if not visible:
+            log_and_print("[AutoBridge] Marker search page has no candidates; scrolling up.")
+            self.viber.scroll(amount=self._setting_int("backlog_scroll_count", 1), wheel_dist=5)
+            cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
+            return
+
+        for candidate in reversed(visible):
+            message = self.get_candidate_message(candidate)
+            if not message:
+                continue
+
+            content_key = self.message_content_key(message)
+            if not content_key:
+                continue
+
+            if self.message_is_sent_boundary(message):
+                self.marker_cycle_phase = "send_down"
+                self.marker_cycle_marker_y = candidate["y"]
+                log_and_print(
+                    "[AutoBridge] Sent marker found; sending newer messages below it: "
+                    f"signature={candidate['signature']}, y={candidate['y']}, key={content_key}"
+                )
+                await self.send_pending_down_page()
+                return
+
+            log_and_print(
+                "[AutoBridge] Candidate above current bottom is not delivered yet; "
+                f"continue marker search upward: {content_key}"
+            )
+
+        max_pages = self._setting_int("marker_search_max_pages", 80)
+        if self.marker_cycle_find_pages >= max_pages:
+            log_and_print(
+                "[AutoBridge] Sent marker was not found before max pages; "
+                "pausing and will retry from bottom.",
+                "warning",
+            )
+            self.complete_marker_cycle()
+            return
+
+        log_and_print(
+            "[AutoBridge] Sent marker not found on this page; scrolling up. "
+            f"pages={self.marker_cycle_find_pages}/{max_pages}"
+        )
+        self.viber.scroll(amount=self._setting_int("backlog_scroll_count", 1), wheel_dist=5)
+        cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
+
+    async def send_pending_down_page(self):
+        self.viber.focus()
+        visible = self.collect_visible_candidates()
+        self.save_debug_screenshot("marker_send_down")
+        page_signature = self.visible_page_signature(visible)
+
+        if page_signature and page_signature == self.marker_cycle_last_down_signature:
+            log_and_print("[AutoBridge] Bottom reached after downward send scan; cycle complete.")
+            self.complete_marker_cycle()
+            return
+
+        if not visible:
+            log_and_print("[AutoBridge] Send-down page has no candidates; scrolling down.")
+            self.marker_cycle_last_down_signature = page_signature
+            self.viber.scroll(amount=self._send_down_scroll_count(), wheel_dist=-5)
+            cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
+            return
+
+        marker_y = self.marker_cycle_marker_y
+        if marker_y is not None:
+            candidates = [candidate for candidate in visible if candidate["y"] > marker_y]
+            self.marker_cycle_marker_y = None
+        else:
+            candidates = list(visible)
+
+        log_and_print(
+            "[AutoBridge] Send-down page queued: "
+            f"candidates={len(candidates)}, page_items={len(visible)}"
+        )
+
+        skip_candidates_until_y = -1
+        for candidate in candidates:
+            if candidate["y"] <= skip_candidates_until_y:
+                log_and_print(
+                    "[AutoBridge] Candidate skipped inside already copied long message area: "
+                    f"{candidate['signature']}, y={candidate['y']}, until={skip_candidates_until_y}"
+                )
+                continue
+
+            message = self.get_candidate_message(candidate)
+            if not message:
+                continue
+
+            content_key = self.message_content_key(message)
+            if not content_key:
+                continue
+            skip_px = self.estimated_same_message_skip_px(message)
+            if skip_px:
+                skip_candidates_until_y = max(skip_candidates_until_y, candidate["y"] + skip_px)
+            if content_key in self.marker_cycle_sent_keys:
+                log_and_print(f"[AutoBridge] Send-down duplicate skipped: {content_key}")
+                continue
+
+            status = await self.deliver_message_with_registry(message)
+            self.marker_cycle_sent_keys.add(content_key)
+            if status == "partial_failed":
+                log_and_print(
+                    f"[AutoBridge] Message partially failed; pending targets remain for next cycle: {content_key}",
+                    "warning",
+                )
+
+        self.marker_cycle_last_down_signature = page_signature
+        log_and_print("[AutoBridge] Send-down page processed; scrolling down.")
+        self.viber.scroll(amount=self._send_down_scroll_count(), wheel_dist=-5)
+        cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
+
+    def complete_marker_cycle(self):
+        delay = self._read_delay()
+        self.marker_cycle_phase = "paused"
+        self.marker_cycle_pause_until = time.monotonic() + delay
+        self.marker_cycle_marker_y = None
+        self.marker_cycle_last_down_signature = None
+        log_and_print(f"[AutoBridge] Cycle complete. Waiting {delay}s before next full scan.")
+
+    def visible_page_signature(self, visible):
+        if not visible:
+            return "empty"
+        return "|".join(candidate["signature"] for candidate in visible)
+
+    def get_candidate_message(self, candidate):
+        signature = candidate["signature"]
+        cached = self.marker_cycle_message_cache.get(signature)
+        if cached is not None:
+            log_and_print(f"[AutoBridge] Candidate message cache hit: {signature}")
+            return cached
+
+        message = self.copy_candidate_after_delay(candidate)
+        if message:
+            self.marker_cycle_message_cache[signature] = message
+        return message
+
+    def estimated_same_message_skip_px(self, message):
+        if message.get("type") != "text":
+            return 0
+        text_len = len(self.canonical_text_for_registry(message.get("text", "")))
+        if text_len < self._setting_int("long_text_skip_min_chars", 240):
+            return 0
+        return min(
+            self._setting_int("long_text_skip_max_px", 700),
+            max(
+                self._setting_int("long_text_skip_min_px", 180),
+                int(text_len * float(self.settings.get("long_text_skip_px_per_char", 0.35))),
+            ),
+        )
 
     async def process_backlog_page(self):
         self.viber.focus()
@@ -399,6 +597,17 @@ class AutoBridge:
 
         return "partial_failed"
 
+    def message_is_sent_boundary(self, message):
+        content_key = self.message_content_key(message)
+        if not content_key:
+            return False
+        if self.legacy_message_marked_sent(message):
+            return True
+        if self.sent_store.delivered_to_all(content_key, self.channel_names):
+            return True
+        delivered = self.sent_store.deliveries.get(content_key, [])
+        return bool(delivered)
+
     def legacy_message_marked_sent(self, message):
         if message["type"] == "text":
             return any(self.sent_store.has_text(text) for text in self.text_registry_variants(message.get("text", "")))
@@ -446,8 +655,9 @@ class AutoBridge:
 
     async def send_one_message_to_target(self, message, channel_name):
         if message["type"] == "text":
-            log_and_print(f"[AutoBridge] Sending text to Telegram target {channel_name}: {message['text']}")
-            return await process_one_message(message["text"], self.bot_client, channel_name, self.name_viber, None)
+            text = self.telegram_text_for_send(message["text"])
+            log_and_print(f"[AutoBridge] Sending text to Telegram target {channel_name}: {text}")
+            return await process_one_message(text, self.bot_client, channel_name, self.name_viber, None)
 
         if message["type"] == "image":
             bio = BytesIO()
@@ -466,6 +676,9 @@ class AutoBridge:
 
         log_and_print(f"[AutoBridge] Unsupported message type for send: {message}", "warning")
         return False
+
+    def telegram_text_for_send(self, text):
+        return strip_viber_text_header(text) or normalize_text(text)
 
     def find_visible_candidate_for_pending(self, pending):
         self.viber.focus()
@@ -538,6 +751,13 @@ class AutoBridge:
         if not self.actions_compatible(expected_type, action):
             self.close_context_menu(x, y)
             return None
+
+        if action == "image" and menu_items.get("isImage"):
+            menu_key = self.menu_key_for_action(action, menu_items)
+            self.click_menu_item(menu_region, menu_items[menu_key])
+            cv2.waitKey(self._setting_int("clipboard_wait_ms", 700))
+            self.save_debug_screenshot("after_image_copy")
+            return self.message_from_clipboard("image")
 
         if menu_items.get("isSelect"):
             return self.copy_selected_message(candidate, menu_region, menu_items, action)
@@ -655,7 +875,7 @@ class AutoBridge:
                 "key": f"image:{image_hash}",
             }
 
-        if expected_type in ("file", "video", "voice"):
+        if expected_type in ("file", "video", "voice", "image"):
             log_and_print(
                 f"[AutoBridge] Clipboard has no file/image data for expected {expected_type}.",
                 "warning",
@@ -1019,6 +1239,9 @@ class AutoBridge:
 
     def _backlog_stop_after(self):
         return max(1, self._setting_int("backlog_stop_after_sent_count", 3))
+
+    def _send_down_scroll_count(self):
+        return max(1, self._setting_int("marker_send_down_scroll_count", 3))
 
     def _setting_int(self, name, default):
         try:
