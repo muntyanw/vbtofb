@@ -55,6 +55,12 @@
             0,
             40
         ],
+        "scan_bottom_probe_offsets_px": [
+            0,
+            20,
+            40,
+            60
+        ],
         "scan_top_skip_px": 18,
         "scan_bottom_skip_px": 12,
         "message_click_x_ratio": 0.22,

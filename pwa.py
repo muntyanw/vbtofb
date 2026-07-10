@@ -514,6 +514,7 @@ class AutoBridge:
         capture = self.settings.get("auto_capture", {})
         step = max(20, int(capture.get("scan_step_px", 80)))
         offsets = capture.get("scan_step_offsets_px", [0, step // 2])
+        bottom_offsets = capture.get("scan_bottom_probe_offsets_px", [0, 20, 40, 60])
         x_ratios = capture.get("message_click_x_ratios", [capture.get("message_click_x_ratio", 0.22)])
         y_min = region.top + int(capture.get("scan_top_skip_px", 18))
         y_max = region.bottom - int(capture.get("scan_bottom_skip_px", 12))
@@ -523,13 +524,19 @@ class AutoBridge:
         y_values = []
         y_seen = set()
 
+        def add_scan_y(scan_y):
+            scan_y = int(scan_y)
+            if scan_y < y_min or scan_y > y_max or scan_y in y_seen:
+                return
+            y_seen.add(scan_y)
+            y_values.append(scan_y)
+
+        for offset in bottom_offsets:
+            add_scan_y(y_max - int(offset))
+
         for y in range(y_max, y_min, -step):
             for offset in offsets:
-                scan_y = int(y - int(offset))
-                if scan_y <= y_min or scan_y >= y_max or scan_y in y_seen:
-                    continue
-                y_seen.add(scan_y)
-                y_values.append(scan_y)
+                add_scan_y(y - int(offset))
 
         for y in sorted(y_values, reverse=True):
             for x_ratio in x_ratios:
