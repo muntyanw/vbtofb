@@ -8,6 +8,7 @@ venv/
 
 # Runtime/debug artifacts
 runtime_debug/
+runtime_media_cache/
 debug_run*/
 debug_*.png
 runtime_*.log

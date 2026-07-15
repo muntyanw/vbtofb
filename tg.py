@@ -1,5 +1,7 @@
 from log import log_and_print  # Импорт функции логирования
 import asyncio
+import hashlib
+import shutil
 from datetime import datetime
 from pathlib import Path
 import traceback
@@ -46,9 +48,12 @@ async def send_message_to_tg_channel(bot_client, channel_name, message_text, ima
 
         # Отправка сообщения с изображением или только текста
         if image_path:
+            media_path = prepare_telegram_media_path(image_path)
+            if not media_path:
+                return False
             await bot_client.send_file(
                 channel_entity,
-                image_path,
+                media_path,
                 caption=message_text[:1024]  # Обрезаем подпись до допустимой длины
             )
         else:
@@ -66,6 +71,37 @@ async def send_message_to_tg_channel(bot_client, channel_name, message_text, ima
     except Exception as e:
         log_and_print(f"Непредвиденная ошибка при отправке сообщения в канал: {e}", 'error')
         return False
+
+
+def prepare_telegram_media_path(image_path):
+    if hasattr(image_path, "read"):
+        try:
+            image_path.seek(0)
+        except Exception:
+            pass
+        return image_path
+
+    source = Path(str(image_path))
+    if not source.is_file():
+        log_and_print(f"Telegram media file does not exist: {image_path}", "error")
+        return None
+
+    try:
+        str(source).encode("ascii")
+        return str(source)
+    except UnicodeEncodeError:
+        pass
+
+    cache_dir = Path("runtime_media_cache")
+    cache_dir.mkdir(exist_ok=True)
+    stat = source.stat()
+    digest_source = f"{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", errors="ignore")
+    digest = hashlib.sha256(digest_source).hexdigest()[:24]
+    target = cache_dir / f"tg_media_{digest}{source.suffix.lower()}"
+    if not target.exists() or target.stat().st_size != stat.st_size:
+        shutil.copy2(source, target)
+    log_and_print(f"Telegram media path normalized for send_file: {target}", "info")
+    return str(target)
 
 async def check_connection(bot_client):
     while True:

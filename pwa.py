@@ -9,10 +9,13 @@ from io import BytesIO
 from pathlib import Path
 
 import cv2
+import numpy as np
 import pyautogui
 import pyperclip
 import win32clipboard
+import win32com.client
 import win32con
+import win32gui
 from PIL import Image, ImageGrab
 
 from init import init as load_config
@@ -30,13 +33,19 @@ class AutoBridge:
         self.name_viber = name_viber
         self.channel_names = channel_names
         self.settings = settings
+        registry_reset_interval = int(settings.get("message_registry_reset_interval_seconds", 3600))
+        registry_preserve_latest = int(settings.get("message_registry_preserve_latest_count", 3))
         self.sent_store = MessageStore(
             path=settings.get("sent_messages_file", "sent_messages.json"),
             max_items=int(settings.get("sent_messages_limit", 1000)),
+            reset_interval_seconds=registry_reset_interval,
+            preserve_latest_count=registry_preserve_latest,
         )
         self.seen_store = MessageStore(
             path=settings.get("seen_messages_file", "seen_messages.json"),
             max_items=int(settings.get("seen_messages_limit", settings.get("sent_messages_limit", 1000))),
+            reset_interval_seconds=registry_reset_interval,
+            preserve_latest_count=registry_preserve_latest,
         )
         self.viber = ViberWindow(settings)
         self.pending_candidates = {}
@@ -53,10 +62,16 @@ class AutoBridge:
         self.marker_cycle_marker_y = None
         self.marker_cycle_find_pages = 0
         self.marker_cycle_last_down_signature = None
+        self.marker_cycle_last_down_content_signature = None
+        self.marker_cycle_same_content_pages = 0
         self.marker_cycle_sent_keys = set()
         self.marker_cycle_message_cache = {}
+        self.marker_cycle_boundary_streak = 0
+        self.marker_cycle_boundary_keys = []
+        self.marker_cycle_boundary_y = None
+        self.marker_cycle_control_remaining = 0
         self.debug_dir = Path(settings.get("debug_screenshot_dir", "runtime_debug"))
-        self.debug_screenshots = bool(settings.get("debug_screenshots_enabled", True))
+        self.debug_screenshots = bool(settings.get("debug_screenshots_enabled", False))
         self.shot_index = 0
 
     async def run(self):
@@ -72,6 +87,7 @@ class AutoBridge:
 
         while True:
             try:
+                self.reset_expired_message_registries()
                 if self._backlog_scan_enabled():
                     await self.process_marker_cycle()
                 else:
@@ -80,6 +96,25 @@ class AutoBridge:
                 log_and_print(f"[AutoBridge] Read loop error: {exc}", "error")
                 log_and_print(traceback.format_exc(), "error")
             await asyncio.sleep(self._check_interval())
+
+    def reset_expired_message_registries(self):
+        sent_cleared = self.sent_store.clear_if_expired()
+        seen_cleared = self.seen_store.clear_if_expired()
+        if not (sent_cleared or seen_cleared):
+            return
+
+        self.marker_cycle_phase = "idle"
+        self.marker_cycle_sent_keys.clear()
+        self.marker_cycle_message_cache.clear()
+        self.backlog_processed_content_keys.clear()
+        self.backlog_scanned_signatures.clear()
+        self.known_candidate_signatures.clear()
+        self.pending_candidates.clear()
+        log_and_print(
+            "[AutoBridge] Message registries expired; old entries were cleared "
+            "and protected recent entries were retained; "
+            "starting a fresh scan cycle."
+        )
 
     async def process_marker_cycle(self):
         now = time.monotonic()
@@ -95,7 +130,7 @@ class AutoBridge:
 
         if self.marker_cycle_phase == "find_marker_up":
             await self.find_sent_marker_up()
-        elif self.marker_cycle_phase == "send_down":
+        elif self.marker_cycle_phase in ("send_down", "send_down_control"):
             await self.send_pending_down_page()
 
     def start_marker_cycle(self):
@@ -107,8 +142,14 @@ class AutoBridge:
         self.marker_cycle_marker_y = None
         self.marker_cycle_find_pages = 0
         self.marker_cycle_last_down_signature = None
+        self.marker_cycle_last_down_content_signature = None
+        self.marker_cycle_same_content_pages = 0
         self.marker_cycle_sent_keys.clear()
         self.marker_cycle_message_cache.clear()
+        self.marker_cycle_boundary_streak = 0
+        self.marker_cycle_boundary_keys.clear()
+        self.marker_cycle_boundary_y = None
+        self.marker_cycle_control_remaining = 0
         self.backlog_scanned_signatures.clear()
         self.backlog_processed_content_keys.clear()
         log_and_print(
@@ -128,7 +169,12 @@ class AutoBridge:
             cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
             return
 
-        for candidate in reversed(visible):
+        # Search from newest to oldest. This phase only establishes a stable
+        # boundary; sending before the boundary is known breaks message order.
+        # Pending messages do not reset protected sent markers. After registry
+        # expiry the three retained markers can have missed messages between
+        # them, and those gaps are exactly what the downward pass must recover.
+        for candidate in sorted(visible, key=lambda item: item["y"], reverse=True):
             message = self.get_candidate_message(candidate)
             if not message:
                 continue
@@ -138,18 +184,42 @@ class AutoBridge:
                 continue
 
             if self.message_is_sent_boundary(message):
-                self.marker_cycle_phase = "send_down"
-                self.marker_cycle_marker_y = candidate["y"]
+                if content_key in self.marker_cycle_boundary_keys:
+                    log_and_print(
+                        "[AutoBridge] Duplicate sent boundary candidate ignored: "
+                        f"streak={self.marker_cycle_boundary_streak}/{self._marker_stop_after_sent_count()}, "
+                        f"signature={candidate['signature']}, y={candidate['y']}, key={content_key}"
+                    )
+                    continue
+
+                self.marker_cycle_boundary_keys.append(content_key)
+                self.marker_cycle_boundary_streak = len(self.marker_cycle_boundary_keys)
                 log_and_print(
-                    "[AutoBridge] Sent marker found; sending newer messages below it: "
+                    "[AutoBridge] Sent boundary candidate found: "
+                    f"streak={self.marker_cycle_boundary_streak}/{self._marker_stop_after_sent_count()}, "
                     f"signature={candidate['signature']}, y={candidate['y']}, key={content_key}"
                 )
-                await self.send_pending_down_page()
-                return
+                if self.marker_cycle_boundary_streak >= self._marker_stop_after_sent_count():
+                    self.marker_cycle_phase = "send_down"
+                    # Registry expiry may happen during a long video backlog.
+                    # Keep boundary messages protected for this whole cycle so
+                    # reaching them again on the downward pass cannot resend them.
+                    self.marker_cycle_sent_keys.update(self.marker_cycle_boundary_keys)
+                    # Use the third marker that is visible now. A streak can span
+                    # two scrolled pages, so an older saved Y coordinate is unsafe.
+                    self.marker_cycle_marker_y = candidate["y"]
+                    log_and_print(
+                        "[AutoBridge] Sent boundary confirmed; sending newer messages below it: "
+                        f"marker_y={self.marker_cycle_marker_y}"
+                    )
+                    await self.send_pending_down_page()
+                    return
+                continue
 
             log_and_print(
-                "[AutoBridge] Candidate above current bottom is not delivered yet; "
-                f"continue marker search upward: {content_key}"
+                "[AutoBridge] Pending candidate found during boundary search; "
+                "retaining previously found sent markers and not sending until "
+                f"the three-message boundary is confirmed: {content_key}"
             )
 
         max_pages = self._setting_int("marker_search_max_pages", 80)
@@ -176,7 +246,9 @@ class AutoBridge:
         page_signature = self.visible_page_signature(visible)
 
         if page_signature and page_signature == self.marker_cycle_last_down_signature:
-            log_and_print("[AutoBridge] Bottom reached after downward send scan; cycle complete.")
+            log_and_print("[AutoBridge] Bottom reached after downward send scan.")
+            if self.start_bottom_control_scan_if_needed():
+                return
             self.complete_marker_cycle()
             return
 
@@ -189,10 +261,13 @@ class AutoBridge:
 
         marker_y = self.marker_cycle_marker_y
         if marker_y is not None:
-            candidates = [candidate for candidate in visible if candidate["y"] > marker_y]
+            candidates = sorted(
+                (candidate for candidate in visible if candidate["y"] > marker_y),
+                key=lambda item: item["y"],
+            )
             self.marker_cycle_marker_y = None
         else:
-            candidates = list(visible)
+            candidates = sorted(visible, key=lambda item: item["y"])
 
         log_and_print(
             "[AutoBridge] Send-down page queued: "
@@ -200,6 +275,9 @@ class AutoBridge:
         )
 
         skip_candidates_until_y = -1
+        page_content_keys = set()
+        page_duplicate_keys = 0
+        stop_after_duplicate_keys = self._page_duplicate_content_stop_after()
         for candidate in candidates:
             if candidate["y"] <= skip_candidates_until_y:
                 log_and_print(
@@ -215,6 +293,17 @@ class AutoBridge:
             content_key = self.message_content_key(message)
             if not content_key:
                 continue
+            if content_key in page_content_keys:
+                page_duplicate_keys += 1
+                log_and_print(f"[AutoBridge] Send-down duplicate content skipped on page: {content_key}")
+                if page_duplicate_keys >= stop_after_duplicate_keys:
+                    log_and_print(
+                        "[AutoBridge] Send-down stops this page after repeated duplicate content: "
+                        f"duplicates={page_duplicate_keys}/{stop_after_duplicate_keys}"
+                    )
+                    break
+                continue
+            page_content_keys.add(content_key)
             skip_px = self.estimated_same_message_skip_px(message)
             if skip_px:
                 skip_candidates_until_y = max(skip_candidates_until_y, candidate["y"] + skip_px)
@@ -230,23 +319,83 @@ class AutoBridge:
                     "warning",
                 )
 
+        if self.down_content_page_repeated(page_content_keys):
+            log_and_print(
+                "[AutoBridge] Bottom reached after repeated stable content page: "
+                f"repeats={self.marker_cycle_same_content_pages}/"
+                f"{self._bottom_same_content_pages()}"
+            )
+            if self.start_bottom_control_scan_if_needed():
+                return
+            self.complete_marker_cycle()
+            return
+
         self.marker_cycle_last_down_signature = page_signature
         log_and_print("[AutoBridge] Send-down page processed; scrolling down.")
         self.viber.scroll(amount=self._send_down_scroll_count(), wheel_dist=-5)
         cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
 
+    def start_bottom_control_scan_if_needed(self):
+        if self.marker_cycle_phase == "send_down_control":
+            self.marker_cycle_control_remaining -= 1
+            if self.marker_cycle_control_remaining > 0:
+                log_and_print(
+                    "[AutoBridge] Bottom control scan pass complete; repeating: "
+                    f"remaining={self.marker_cycle_control_remaining}"
+                )
+                self.viber.scroll_to_bottom(self._setting_int("scroll_to_bottom_count", 2))
+                self.marker_cycle_last_down_signature = None
+                self.marker_cycle_last_down_content_signature = None
+                self.marker_cycle_same_content_pages = 0
+                return True
+            log_and_print("[AutoBridge] Bottom control scan complete.")
+            return False
+
+        passes = self._bottom_control_passes()
+        if passes <= 0:
+            return False
+        self.marker_cycle_phase = "send_down_control"
+        self.marker_cycle_control_remaining = passes
+        self.marker_cycle_last_down_signature = None
+        self.marker_cycle_last_down_content_signature = None
+        self.marker_cycle_same_content_pages = 0
+        self.marker_cycle_marker_y = None
+        self.viber.scroll_to_bottom(self._setting_int("scroll_to_bottom_count", 2))
+        log_and_print(f"[AutoBridge] Starting bottom control scan: passes={passes}")
+        return True
+
     def complete_marker_cycle(self):
-        delay = self._read_delay()
+        delay = self._cycle_pause_seconds()
         self.marker_cycle_phase = "paused"
         self.marker_cycle_pause_until = time.monotonic() + delay
         self.marker_cycle_marker_y = None
         self.marker_cycle_last_down_signature = None
+        self.marker_cycle_last_down_content_signature = None
+        self.marker_cycle_same_content_pages = 0
+        self.marker_cycle_boundary_streak = 0
+        self.marker_cycle_boundary_keys.clear()
+        self.marker_cycle_boundary_y = None
+        self.marker_cycle_control_remaining = 0
         log_and_print(f"[AutoBridge] Cycle complete. Waiting {delay}s before next full scan.")
 
     def visible_page_signature(self, visible):
         if not visible:
             return "empty"
         return "|".join(candidate["signature"] for candidate in visible)
+
+    def down_content_page_repeated(self, content_keys):
+        signature = "|".join(sorted(content_keys))
+        if not signature:
+            self.marker_cycle_last_down_content_signature = None
+            self.marker_cycle_same_content_pages = 0
+            return False
+
+        if signature == self.marker_cycle_last_down_content_signature:
+            self.marker_cycle_same_content_pages += 1
+        else:
+            self.marker_cycle_last_down_content_signature = signature
+            self.marker_cycle_same_content_pages = 1
+        return self.marker_cycle_same_content_pages >= self._bottom_same_content_pages()
 
     def get_candidate_message(self, candidate):
         signature = candidate["signature"]
@@ -261,6 +410,8 @@ class AutoBridge:
         return message
 
     def estimated_same_message_skip_px(self, message):
+        if not bool(self.settings.get("long_text_skip_enabled", False)):
+            return 0
         if message.get("type") != "text":
             return 0
         text_len = len(self.canonical_text_for_registry(message.get("text", "")))
@@ -375,10 +526,16 @@ class AutoBridge:
 
     async def wait_and_deliver_backlog_candidate(self, candidate):
         delay = self._read_delay()
-        log_and_print(
-            f"[AutoBridge] Backlog candidate is not delivered yet; "
-            f"waiting {delay}s before second scan/send: {candidate['signature']}"
-        )
+        if delay > 0:
+            log_and_print(
+                f"[AutoBridge] Backlog candidate is not delivered yet; "
+                f"waiting {delay}s before second scan/send: {candidate['signature']}"
+            )
+        else:
+            log_and_print(
+                f"[AutoBridge] Backlog candidate is not delivered yet; "
+                f"second scan/send starts immediately: {candidate['signature']}"
+            )
         await self.wait_before_backlog_copy(delay)
 
         confirmed = self.find_visible_candidate_for_pending(candidate)
@@ -432,6 +589,7 @@ class AutoBridge:
 
         now = time.monotonic()
         visible_signatures = {candidate["signature"] for candidate in visible}
+        read_delay = self._read_delay()
 
         for signature in list(self.pending_candidates):
             if signature not in visible_signatures:
@@ -459,9 +617,16 @@ class AutoBridge:
                 candidate["misses"] = 0
                 candidate["_pending_key"] = signature
                 self.pending_candidates[signature] = candidate
+                if read_delay <= 0:
+                    log_and_print(
+                        f"[AutoBridge] New candidate queued for immediate read: signature={signature}, "
+                        f"type={candidate['type']}"
+                    )
+                    ready.append(candidate)
+                    continue
                 log_and_print(
                     f"[AutoBridge] New candidate queued for delayed read: signature={signature}, "
-                    f"type={candidate['type']}, delay={self._read_delay()}s"
+                    f"type={candidate['type']}, delay={read_delay}s"
                 )
                 continue
 
@@ -471,16 +636,16 @@ class AutoBridge:
             pending["first_seen"] = first_seen
             pending["_pending_key"] = signature
             elapsed = now - pending["first_seen"]
-            if elapsed >= self._read_delay():
+            if elapsed >= read_delay:
                 log_and_print(
                     f"[AutoBridge] Candidate delay elapsed: signature={signature}, "
-                    f"elapsed={elapsed:.1f}/{self._read_delay()}s"
+                    f"elapsed={elapsed:.1f}/{read_delay}s"
                 )
                 ready.append(pending)
             else:
                 log_and_print(
                     f"[AutoBridge] Candidate waiting before read: signature={signature}, "
-                    f"elapsed={elapsed:.1f}/{self._read_delay()}s"
+                    f"elapsed={elapsed:.1f}/{read_delay}s"
                 )
 
         for candidate in ready:
@@ -512,6 +677,22 @@ class AutoBridge:
     def collect_visible_candidates(self):
         region = self.viber.messages_region()
         capture = self.settings.get("auto_capture", {})
+        anchor_enabled = bool(capture.get("reaction_anchor", {}).get("enabled", False))
+        if anchor_enabled:
+            anchor_candidates = self.collect_anchor_candidates(region, capture)
+            media_group_candidates = self.collect_media_group_candidates(region, capture)
+            candidates = self.dedupe_candidates_by_y(
+                sorted(anchor_candidates + media_group_candidates, key=lambda item: item["y"]),
+                self._setting_int("candidate_y_dedupe_px", 90),
+            )
+            log_and_print(
+                "[AutoBridge] Visible candidates found by anchors: "
+                f"reactions={len(anchor_candidates)}, media_groups={len(media_group_candidates)}, "
+                f"total={len(candidates)}"
+            )
+            self.write_debug_json("visible_candidates", candidates)
+            return candidates
+
         step = max(20, int(capture.get("scan_step_px", 80)))
         offsets = capture.get("scan_step_offsets_px", [0, step // 2])
         bottom_offsets = capture.get("scan_bottom_probe_offsets_px", [0, 20, 40, 60])
@@ -521,6 +702,8 @@ class AutoBridge:
 
         candidates = []
         seen = set()
+        accepted_candidate_y = []
+        candidate_y_gap = self._setting_int("candidate_y_dedupe_px", 90)
         y_values = []
         y_seen = set()
 
@@ -539,6 +722,12 @@ class AutoBridge:
                 add_scan_y(y - int(offset))
 
         for y in sorted(y_values, reverse=True):
+            if any(abs(y - accepted_y) <= candidate_y_gap for accepted_y in accepted_candidate_y):
+                log_and_print(
+                    "[AutoBridge] Scan Y skipped near already detected candidate: "
+                    f"y={y}, gap={candidate_y_gap}"
+                )
+                continue
             for x_ratio in x_ratios:
                 x = region.left + int(region.width * float(x_ratio))
                 candidate = self.inspect_candidate_at(x, y)
@@ -548,11 +737,206 @@ class AutoBridge:
                     continue
                 seen.add(candidate["key"])
                 candidates.append(candidate)
+                accepted_candidate_y.append(candidate["y"])
                 break
 
         candidates.reverse()
+        candidates = self.dedupe_candidates_by_y(
+            candidates,
+            self._setting_int("candidate_y_dedupe_px", 90),
+        )
         log_and_print(f"[AutoBridge] Visible candidates found: {len(candidates)}")
         self.write_debug_json("visible_candidates", candidates)
+        return candidates
+
+    def dedupe_candidates_by_y(self, candidates, tolerance_px):
+        if tolerance_px <= 0:
+            return candidates
+
+        deduped = []
+        for candidate in candidates:
+            if any(abs(candidate["y"] - kept["y"]) <= tolerance_px for kept in deduped):
+                log_and_print(
+                    "[AutoBridge] Candidate skipped as same message row: "
+                    f"{candidate['signature']}, y={candidate['y']}, tolerance={tolerance_px}"
+                )
+                continue
+            deduped.append(candidate)
+        return deduped
+
+    def collect_anchor_candidates(self, region, capture):
+        anchor = capture.get("reaction_anchor", {})
+        if not bool(anchor.get("enabled", False)):
+            return []
+
+        template_paths = self.reaction_anchor_template_paths(anchor)
+        if not template_paths:
+            log_and_print("[AutoBridge] Reaction anchor is enabled but no templates are configured.", "warning")
+            return []
+
+        screenshot = ImageGrab.grab((region.left, region.top, region.right, region.bottom))
+        haystack = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2GRAY)
+        threshold = float(anchor.get("threshold", 0.82))
+        matches = []
+
+        for template_path in template_paths:
+            path = Path(template_path)
+            if not path.exists():
+                log_and_print(f"[AutoBridge] Reaction anchor template not found: {template_path}", "warning")
+                continue
+
+            template = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if template is None:
+                log_and_print(f"[AutoBridge] Reaction anchor template cannot be loaded: {template_path}", "warning")
+                continue
+
+            result = cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED)
+            ys, xs = np.where(result >= threshold)
+            if len(xs) == 0:
+                log_and_print(f"[AutoBridge] Reaction anchor template found no matches: {template_path}")
+                continue
+
+            h, w = template.shape[:2]
+            for x, y in zip(xs, ys):
+                matches.append({
+                    "x": int(region.left + x + w // 2),
+                    "y": int(region.top + y + h // 2),
+                    "score": float(result[y, x]),
+                    "template": str(path),
+                })
+
+        if not matches:
+            log_and_print("[AutoBridge] Reaction anchor templates found no matches.")
+            return []
+
+        y_tolerance = max(4, int(anchor.get("dedupe_y_tolerance_px", 28)))
+        grouped = []
+        for match in sorted(matches, key=lambda item: (-item["score"], item["y"])):
+            if any(abs(match["y"] - kept["y"]) <= y_tolerance for kept in grouped):
+                continue
+            grouped.append(match)
+
+        click_offset_x = int(anchor.get("click_offset_x_px", -140))
+        click_offset_y = int(anchor.get("click_offset_y_px", 0))
+        min_x = region.left + int(anchor.get("min_click_left_padding_px", 35))
+        max_x = region.right - int(anchor.get("max_click_right_padding_px", 35))
+        candidates = []
+        seen_rows = set()
+
+        for match in sorted(grouped, key=lambda item: item["y"], reverse=True):
+            row = int(match["y"] // y_tolerance)
+            if row in seen_rows:
+                continue
+            seen_rows.add(row)
+
+            click_x = min(max(int(match["x"] + click_offset_x), min_x), max_x)
+            click_y = int(match["y"] + click_offset_y)
+            visual_hash = self.screen_patch_hash(click_x, click_y)
+            candidate = {
+                "type": "copy",
+                "x": click_x,
+                "y": click_y,
+                "visual_hash": visual_hash,
+                "signature": f"copy:{visual_hash}",
+                "key": f"copy:{click_x}:{click_y}:{visual_hash}",
+            }
+
+            candidate["anchor"] = {
+                "type": "reaction",
+                "x": match["x"],
+                "y": match["y"],
+                "score": round(match["score"], 4),
+                "template": match.get("template"),
+            }
+            log_and_print(
+                "[AutoBridge] Candidate created directly from reaction anchor without menu probe: "
+                f"anchor=({match['x']},{match['y']}), click=({click_x},{click_y}), "
+                f"score={match['score']:.3f}"
+            )
+            candidates.append(candidate)
+
+        return self.dedupe_candidates_by_y(
+            list(reversed(candidates)),
+            self._setting_int("candidate_y_dedupe_px", 90),
+        )
+
+    def reaction_anchor_template_paths(self, anchor):
+        paths = []
+        raw_paths = anchor.get("template_paths", [])
+        if isinstance(raw_paths, str):
+            raw_paths = [raw_paths]
+        elif not isinstance(raw_paths, list):
+            raw_paths = []
+
+        legacy_path = anchor.get("template_path", "")
+        for value in [legacy_path, *raw_paths]:
+            if not value:
+                continue
+            value = str(value)
+            if value not in paths:
+                paths.append(value)
+        return paths
+
+    def collect_media_group_candidates(self, region, capture):
+        anchor = capture.get("media_group_anchor", {})
+        if not bool(anchor.get("enabled", False)):
+            return []
+
+        template_path = Path(str(anchor.get("template_path", "")))
+        if not template_path.is_file():
+            log_and_print(f"[AutoBridge] Media group anchor template not found: {template_path}", "warning")
+            return []
+
+        screenshot = ImageGrab.grab((region.left, region.top, region.right, region.bottom))
+        haystack = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2GRAY)
+        template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
+        if template is None:
+            log_and_print(f"[AutoBridge] Media group anchor template cannot be loaded: {template_path}", "warning")
+            return []
+
+        result = cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED)
+        threshold = float(anchor.get("threshold", 0.86))
+        ys, xs = np.where(result >= threshold)
+        if len(xs) == 0:
+            log_and_print("[AutoBridge] Media group anchor found no matches.")
+            return []
+
+        h, w = template.shape[:2]
+        tolerance = max(4, int(anchor.get("dedupe_y_tolerance_px", 32)))
+        matches = []
+        for x, y in zip(xs, ys):
+            match = {
+                "x": int(region.left + x + w // 2),
+                "y": int(region.top + y + h // 2),
+                "score": float(result[y, x]),
+            }
+            if any(abs(match["y"] - kept["y"]) <= tolerance for kept in matches):
+                continue
+            matches.append(match)
+
+        candidates = []
+        for match in sorted(matches, key=lambda item: item["y"]):
+            visual_hash = self.screen_patch_hash(match["x"], match["y"])
+            candidate = {
+                "type": "media_group",
+                "x": match["x"],
+                "y": match["y"],
+                "visual_hash": visual_hash,
+                "signature": f"media_group:{visual_hash}",
+                "key": f"media_group:{match['x']}:{match['y']}:{visual_hash}",
+                "anchor": {
+                    "type": "media_group",
+                    "x": match["x"],
+                    "y": match["y"],
+                    "score": round(match["score"], 4),
+                    "template": str(template_path),
+                },
+            }
+            log_and_print(
+                "[AutoBridge] Media group candidate created from arrow anchor: "
+                f"anchor=({match['x']},{match['y']}), score={match['score']:.3f}"
+            )
+            candidates.append(candidate)
         return candidates
 
     async def send_message_with_registry(self, message):
@@ -574,6 +958,8 @@ class AutoBridge:
             for channel_name in self.channel_names:
                 self.sent_store.mark_delivered(content_key, channel_name)
                 self.seen_store.mark_delivered(content_key, channel_name)
+            self.sent_store.mark_completed(content_key)
+            self.seen_store.mark_completed(content_key)
             return "already_delivered"
 
         return "pending"
@@ -610,6 +996,8 @@ class AutoBridge:
                 )
 
         if self.sent_store.delivered_to_all(content_key, self.channel_names):
+            self.sent_store.mark_completed(content_key)
+            self.seen_store.mark_completed(content_key)
             self.mark_message_content_sent(message)
             return "delivered_now"
 
@@ -623,8 +1011,12 @@ class AutoBridge:
             return True
         if self.sent_store.delivered_to_all(content_key, self.channel_names):
             return True
-        delivered = self.sent_store.deliveries.get(content_key, [])
-        return bool(delivered)
+        if self.sent_store.deliveries.get(content_key, []):
+            log_and_print(
+                "[AutoBridge] Message has partial deliveries only; not using it as sent boundary: "
+                f"{content_key}"
+            )
+        return False
 
     def legacy_message_marked_sent(self, message):
         if message["type"] == "text":
@@ -642,6 +1034,11 @@ class AutoBridge:
             return f"image:{message.get('image_hash')}"
         if message["type"] in ("file", "video", "voice"):
             return f"file:{message.get('file_hash')}"
+        if message["type"] == "media_group":
+            item_keys = [self.message_content_key(item) for item in message.get("items", [])]
+            if not item_keys or any(not key for key in item_keys):
+                return None
+            return f"media_group:{hash_text('|'.join(item_keys))}"
         return None
 
     def mark_message_content_sent(self, message):
@@ -655,6 +1052,9 @@ class AutoBridge:
         elif message["type"] in ("file", "video", "voice"):
             self.sent_store.mark_file(message["file_hash"])
             self.seen_store.mark_file(message["file_hash"])
+        elif message["type"] == "media_group":
+            for item in message.get("items", []):
+                self.mark_message_content_sent(item)
 
     def canonical_text_for_registry(self, text):
         variants = self.text_registry_variants(text)
@@ -672,6 +1072,33 @@ class AutoBridge:
         return variants
 
     async def send_one_message_to_target(self, message, channel_name):
+        if message["type"] == "media_group":
+            items = message.get("items", [])
+            group_key = self.message_content_key(message)
+            log_and_print(
+                f"[AutoBridge] Sending media group to Telegram target {channel_name}: "
+                f"items={len(items)}"
+            )
+            for index, item in enumerate(items, start=1):
+                item_key = self.message_content_key(item)
+                item_delivery_key = f"{group_key}:item:{index}:{item_key}"
+                if self.sent_store.has_delivery(item_delivery_key, channel_name):
+                    log_and_print(
+                        "[AutoBridge] Media group item already delivered to target; skipping: "
+                        f"item={index}/{len(items)}, target={channel_name}, key={item_delivery_key}"
+                    )
+                    continue
+                if not await self.send_one_message_to_target(item, channel_name):
+                    log_and_print(
+                        "[AutoBridge] Media group item delivery failed: "
+                        f"item={index}/{len(items)}, target={channel_name}, key={item_delivery_key}",
+                        "warning",
+                    )
+                    return False
+                self.sent_store.mark_delivered(item_delivery_key, channel_name)
+                self.seen_store.mark_delivered(item_delivery_key, channel_name)
+            return True
+
         if message["type"] == "text":
             text = self.telegram_text_for_send(message["text"])
             log_and_print(f"[AutoBridge] Sending text to Telegram target {channel_name}: {text}")
@@ -714,35 +1141,55 @@ class AutoBridge:
         return None
 
     def inspect_candidate_at(self, x, y):
-        visual_hash = self.screen_patch_hash(x, y)
+        probes = self.settings.get("inspect_probe_offsets", [[0, 0], [0, -18], [0, 18], [45, 0]])
+        last_items = None
+        for probe in probes:
+            try:
+                dx, dy = probe
+            except (TypeError, ValueError):
+                dx, dy = 0, 0
 
-        self.viber.click_in_messages(x, y, button="right")
-        cv2.waitKey(self._setting_int("context_menu_open_delay_ms", 350))
+            probe_x = int(x + int(dx))
+            probe_y = int(y + int(dy))
+            visual_hash = self.screen_patch_hash(probe_x, probe_y)
 
-        menu_region = self.menu_region_around(x, y)
-        menu_items = self.read_context_menu(menu_region)
-        action = self.choose_menu_action(menu_items)
-        self.close_context_menu(x, y)
+            self.viber.click_in_messages(probe_x, probe_y, button="right")
+            cv2.waitKey(self._setting_int("context_menu_open_delay_ms", 350))
 
-        if not action:
-            log_and_print(f"[AutoBridge] No actionable OCR menu at x={x}, y={y}; items={menu_items}")
-            return None
+            menu_region = self.menu_region_around(probe_x, probe_y)
+            menu_items = self.read_context_menu(menu_region)
+            action = self.choose_menu_action(menu_items)
+            self.close_context_menu(probe_x, probe_y)
+            last_items = menu_items
 
-        candidate = {
-            "type": action,
-            "x": int(x),
-            "y": int(y),
-            "visual_hash": visual_hash,
-            "signature": f"{action}:{visual_hash}",
-            "key": f"{action}:{int(x)}:{int(y)}:{visual_hash}",
-        }
-        log_and_print(f"[AutoBridge] Candidate detected: {candidate}")
-        return candidate
+            if not action:
+                log_and_print(
+                    "[AutoBridge] No actionable OCR menu at probe: "
+                    f"x={probe_x}, y={probe_y}, base=({int(x)},{int(y)}), items={menu_items}"
+                )
+                continue
+
+            candidate = {
+                "type": action,
+                "x": probe_x,
+                "y": probe_y,
+                "visual_hash": visual_hash,
+                "signature": f"{action}:{visual_hash}",
+                "key": f"{action}:{probe_x}:{probe_y}:{visual_hash}",
+            }
+            log_and_print(f"[AutoBridge] Candidate detected: {candidate}")
+            return candidate
+
+        log_and_print(f"[AutoBridge] No actionable OCR menu after probes at x={x}, y={y}; last_items={last_items}")
+        return None
 
     def copy_candidate_after_delay(self, candidate):
         x = candidate["x"]
         y = candidate["y"]
         expected_type = candidate["type"]
+
+        if expected_type == "media_group":
+            return self.copy_media_group(candidate)
 
         self.save_debug_screenshot("before_delayed_copy")
         current_hash = self.screen_patch_hash(x, y)
@@ -777,8 +1224,17 @@ class AutoBridge:
             self.save_debug_screenshot("after_image_copy")
             return self.message_from_clipboard("image")
 
-        if menu_items.get("isSelect"):
+        has_direct_copy = action in ("text", "copy") and bool(
+            menu_items.get("isText") or menu_items.get("isCopy")
+        )
+        if menu_items.get("isSelect") and not has_direct_copy:
             return self.copy_selected_message(candidate, menu_region, menu_items, action)
+
+        if has_direct_copy:
+            log_and_print(
+                "[AutoBridge] Using direct text copy from the first context menu; "
+                "Select is not required."
+            )
 
         if action in ("file", "link"):
             self.close_context_menu(x, y)
@@ -796,6 +1252,12 @@ class AutoBridge:
         if action in ("text", "copy"):
             text = normalize_text(reformat_telegram_text(pyperclip.paste()))
             if text:
+                if self.is_media_placeholder_text(text):
+                    log_and_print(
+                        f"[AutoBridge] Direct clipboard text looks like media placeholder; not sending as text: {text!r}",
+                        "warning",
+                    )
+                    return None
                 log_and_print(f"[AutoBridge] Clipboard text copied: chars={len(text)}")
                 return {"type": "text", "text": text, "key": f"text:{text}"}
 
@@ -813,6 +1275,68 @@ class AutoBridge:
 
         log_and_print(f"[AutoBridge] Clipboard did not contain expected data for action={action}.", "warning")
         return None
+
+    def copy_media_group(self, candidate):
+        anchor = self.settings.get("auto_capture", {}).get("media_group_anchor", {})
+        offsets = anchor.get("tile_offsets_px", [])
+        minimum_items = max(2, int(anchor.get("minimum_items", 2)))
+        if not isinstance(offsets, list) or not offsets:
+            log_and_print("[AutoBridge] Media group has no configured tile offsets.", "warning")
+            return None
+
+        items = []
+        log_and_print(
+            "[AutoBridge] Reading media group tiles: "
+            f"anchor=({candidate['x']},{candidate['y']}), configured_tiles={len(offsets)}"
+        )
+        for index, offset in enumerate(offsets, start=1):
+            try:
+                offset_x, offset_y = (int(value) for value in offset)
+            except (TypeError, ValueError):
+                log_and_print(f"[AutoBridge] Invalid media group tile offset: {offset}", "warning")
+                return None
+
+            tile_x = int(candidate["x"] + offset_x)
+            tile_y = int(candidate["y"] + offset_y)
+            tile_hash = self.screen_patch_hash(tile_x, tile_y)
+            tile_candidate = {
+                "type": "copy",
+                "x": tile_x,
+                "y": tile_y,
+                "visual_hash": tile_hash,
+                "signature": f"media_group_tile:{tile_hash}",
+                "key": f"media_group_tile:{index}:{tile_x}:{tile_y}:{tile_hash}",
+            }
+            log_and_print(
+                "[AutoBridge] Reading media group tile: "
+                f"item={index}/{len(offsets)}, point=({tile_x},{tile_y})"
+            )
+            item = self.copy_candidate_after_delay(tile_candidate)
+            pyautogui.press("esc")
+            cv2.waitKey(self._setting_int("media_group_tile_wait_ms", 300))
+            if not item:
+                log_and_print(
+                    "[AutoBridge] Media group tile could not be read; group will be retried: "
+                    f"item={index}/{len(offsets)}, point=({tile_x},{tile_y})",
+                    "warning",
+                )
+                return None
+            items.append(item)
+
+        if len(items) < minimum_items:
+            log_and_print(
+                f"[AutoBridge] Media group is incomplete: items={len(items)}, minimum={minimum_items}",
+                "warning",
+            )
+            return None
+
+        item_keys = [self.message_content_key(item) for item in items]
+        log_and_print(f"[AutoBridge] Media group read successfully: item_keys={item_keys}")
+        return {
+            "type": "media_group",
+            "items": items,
+            "key": f"media_group:{hash_text('|'.join(item_keys))}",
+        }
 
     def copy_selected_message(self, candidate, menu_region, menu_items, expected_type):
         x = candidate["x"]
@@ -851,7 +1375,7 @@ class AutoBridge:
                 return message
 
             if expected_type in ("file", "video", "voice"):
-                paths = self.reveal_file_from_viber(candidate)
+                paths = self.reveal_file_from_viber(candidate, allow_fallback_rect=True)
                 return self.message_from_file_paths(paths)
 
             return None
@@ -864,14 +1388,34 @@ class AutoBridge:
         if message:
             return message
 
-        if expected_type in ("file", "video", "voice"):
+        placeholder_type = self.media_placeholder_type(pyperclip.paste())
+        if expected_type == "copy" and placeholder_type in ("video", "voice"):
+            expected_type = placeholder_type
+            log_and_print(
+                "[AutoBridge] Selected clipboard marker refined the candidate type: "
+                f"type={expected_type}"
+            )
+
+        if expected_type in ("file", "video", "voice", "copy"):
             log_and_print(
                 "[AutoBridge] Clipboard did not contain file paths after selected Copy; "
                 "trying Show in folder fallback.",
                 "warning",
             )
-            paths = self.reveal_file_from_viber(candidate)
-            return self.message_from_file_paths(paths)
+            paths = self.reveal_file_from_viber(
+                candidate,
+                allow_fallback_rect=expected_type in ("file", "video", "voice"),
+            )
+            file_message = self.message_from_file_paths(paths)
+            if file_message:
+                return file_message
+            if expected_type == "copy":
+                log_and_print(
+                    "[AutoBridge] Generic selected copy fallback did not resolve a file; "
+                    "will retry this candidate later.",
+                    "warning",
+                )
+                return None
 
         log_and_print(f"[AutoBridge] Clipboard did not contain expected selected data: {expected_type}", "warning")
         return None
@@ -903,10 +1447,37 @@ class AutoBridge:
         clipboard_text = repair_clipboard_text(pyperclip.paste())
         text = normalize_text(reformat_telegram_text(clipboard_text))
         if text:
+            if self.is_media_placeholder_text(text):
+                log_and_print(
+                    f"[AutoBridge] Clipboard text looks like media placeholder; not sending as text: {text!r}",
+                    "warning",
+                )
+                return None
             log_and_print(f"[AutoBridge] Clipboard text copied: chars={len(text)}")
             return {"type": "text", "text": text, "key": f"text:{text}"}
 
         return None
+
+    def is_media_placeholder_text(self, text):
+        return self.media_placeholder_type(text) is not None
+
+    def media_placeholder_type(self, text):
+        value = strip_viber_text_header(text) or normalize_text(text)
+        value = value.strip().lower()
+        placeholders = {
+            "видео": "video",
+            "відео": "video",
+            "video": "video",
+            "фото": "image",
+            "photo": "image",
+            "изображение": "image",
+            "зображення": "image",
+            "картинка": "image",
+            "голосовое сообщение": "voice",
+            "голосове повідомлення": "voice",
+            "voice message": "voice",
+        }
+        return placeholders.get(value)
 
     def message_from_file_paths(self, paths):
         file_path = self.choose_sendable_file(paths)
@@ -987,9 +1558,9 @@ class AutoBridge:
         }
 
     def reveal_video_file_from_viber(self, candidate):
-        return self.reveal_file_from_viber(candidate)
+        return self.reveal_file_from_viber(candidate, allow_fallback_rect=True)
 
-    def reveal_file_from_viber(self, candidate):
+    def reveal_file_from_viber(self, candidate, allow_fallback_rect=False):
         x = candidate["x"]
         y = candidate["y"]
 
@@ -1001,22 +1572,39 @@ class AutoBridge:
         menu_region = self.menu_region_around(x, y)
         menu_items = self.read_context_menu(menu_region)
         show_rect = menu_items.get("isShowInFolder")
+        if not show_rect and allow_fallback_rect:
+            show_rect = self.show_in_folder_fallback_rect()
+            if show_rect:
+                log_and_print(
+                    f"[AutoBridge] OCR missed Show in folder; using fallback rect: {show_rect}; "
+                    f"items={menu_items}",
+                    "warning",
+                )
         if not show_rect:
             self.close_context_menu(x, y)
-            log_and_print(f"[AutoBridge] Show in folder item not found for video: {menu_items}", "warning")
+            log_and_print(
+                "[AutoBridge] Show in folder was not confirmed; refusing to guess a file "
+                f"for candidate type={candidate.get('type')}: {menu_items}",
+                "warning",
+            )
             return []
 
         self.click_menu_item(menu_region, show_rect)
         cv2.waitKey(self._setting_int("video_show_in_folder_wait_ms", 5000))
         self.save_debug_screenshot("video_folder_opened")
 
-        pyautogui.hotkey("ctrl", "c")
-        cv2.waitKey(self._setting_int("video_folder_clipboard_wait_ms", 500))
-        paths = self.read_clipboard_file_paths()
+        paths = self.read_selected_explorer_paths()
         if not paths:
-            recent = self.find_recent_downloaded_file()
-            if recent:
-                paths = [recent]
+            self.clear_clipboard()
+            pyautogui.hotkey("ctrl", "c")
+            cv2.waitKey(self._setting_int("video_folder_clipboard_wait_ms", 500))
+            paths = self.read_clipboard_file_paths()
+        if not paths:
+            log_and_print(
+                "[AutoBridge] Explorer did not copy the selected file; "
+                "the candidate will be retried instead of using an unrelated recent file.",
+                "warning",
+            )
 
         if self.settings.get("video_close_folder_after_path", True):
             pyautogui.hotkey("alt", "f4")
@@ -1025,29 +1613,52 @@ class AutoBridge:
 
         return paths
 
-    def find_recent_downloaded_video(self):
-        return self.find_recent_downloaded_file()
+    def read_selected_explorer_paths(self):
+        try:
+            foreground_handle = int(win32gui.GetForegroundWindow())
+            shell = win32com.client.Dispatch("Shell.Application")
+            for window in shell.Windows():
+                try:
+                    if int(window.HWND) != foreground_handle:
+                        continue
+                    selected = window.Document.SelectedItems()
+                    paths = [
+                        str(selected.Item(index).Path)
+                        for index in range(selected.Count)
+                        if selected.Item(index).Path
+                    ]
+                    paths = [path for path in paths if Path(path).is_file()]
+                    log_and_print(f"[AutoBridge] Selected Explorer file paths: {paths}")
+                    return paths
+                except Exception:
+                    continue
+        except Exception as exc:
+            log_and_print(f"[AutoBridge] Failed to read selected Explorer files: {exc}", "warning")
+        return []
 
-    def find_recent_downloaded_file(self):
-        root = Path(self.settings.get("path_files_downloads", "") or "")
-        if not root.exists():
+    def show_in_folder_fallback_rect(self):
+        rect = self.settings.get("show_in_folder_fallback_rect")
+        if rect is None:
+            rect = self.settings.get("context_menu", {}).get("show_in_folder_fallback_rect")
+        if not rect or len(rect) != 4:
+            return None
+        try:
+            return tuple(int(value) for value in rect)
+        except (TypeError, ValueError):
+            log_and_print(f"[AutoBridge] Invalid show_in_folder_fallback_rect setting: {rect}", "warning")
             return None
 
-        sendable_extensions = self.sendable_file_extensions()
-        newest = None
-        for path in root.rglob("*"):
+    def clear_clipboard(self):
+        try:
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+        except Exception as exc:
+            log_and_print(f"[AutoBridge] Failed to clear clipboard: {exc}", "warning")
+        finally:
             try:
-                if not path.is_file() or path.suffix.lower() not in sendable_extensions:
-                    continue
-                if newest is None or path.stat().st_mtime > newest.stat().st_mtime:
-                    newest = path
-            except OSError:
-                continue
-
-        if newest:
-            log_and_print(f"[AutoBridge] Recent downloaded file fallback: {newest}")
-            return str(newest)
-        return None
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
 
     def read_clipboard_file_paths(self):
         paths = []
@@ -1103,11 +1714,25 @@ class AutoBridge:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = self.debug_dir / f"{self.shot_index:04d}_{stamp}_{label}.png"
             ImageGrab.grab().save(path)
+            self.prune_debug_screenshots()
             log_and_print(f"[AutoBridge] Debug screenshot saved: {path}")
             return str(path)
         except Exception as exc:
             log_and_print(f"[AutoBridge] Failed to save debug screenshot {label}: {exc}", "warning")
             return None
+
+    def prune_debug_screenshots(self):
+        max_files = max(1, self._setting_int("debug_screenshot_max_files", 100))
+        screenshots = sorted(
+            self.debug_dir.glob("*.png"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        for path in screenshots[max_files:]:
+            try:
+                path.unlink()
+            except OSError as exc:
+                log_and_print(f"[AutoBridge] Failed to remove old debug screenshot {path}: {exc}", "warning")
 
     def write_debug_json(self, label, data):
         if not self.debug_screenshots:
@@ -1158,14 +1783,16 @@ class AutoBridge:
             return "text"
         if menu_items.get("isCopy"):
             return "copy"
+        if menu_items.get("isSelect"):
+            return "copy"
         return None
 
     def actions_compatible(self, expected, actual):
         if expected == actual:
             return True
-        if expected == "copy" and actual in ("text", "image", "copy"):
+        if expected == "copy" and actual in ("text", "image", "copy", "file", "video", "voice", "link"):
             return True
-        if actual == "copy" and expected in ("text", "image", "copy"):
+        if actual == "copy" and expected in ("text", "image", "copy", "file", "video", "voice", "link"):
             return True
         if expected == "link" and actual in ("link", "text", "copy"):
             return True
@@ -1257,6 +1884,22 @@ class AutoBridge:
 
     def _backlog_stop_after(self):
         return max(1, self._setting_int("backlog_stop_after_sent_count", 3))
+
+    def _marker_stop_after_sent_count(self):
+        return max(1, self._setting_int("marker_stop_after_sent_count", 3))
+
+    def _cycle_pause_seconds(self):
+        default_delay = max(1, self._read_delay() // 2)
+        return max(1, self._setting_int("cycle_pause_seconds", default_delay))
+
+    def _bottom_control_passes(self):
+        return max(0, self._setting_int("bottom_control_passes", 1))
+
+    def _bottom_same_content_pages(self):
+        return max(2, self._setting_int("bottom_same_content_pages", 2))
+
+    def _page_duplicate_content_stop_after(self):
+        return max(1, self._setting_int("page_duplicate_content_stop_after", 1))
 
     def _send_down_scroll_count(self):
         return max(1, self._setting_int("marker_send_down_scroll_count", 3))

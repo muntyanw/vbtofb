@@ -18,17 +18,23 @@
         "\u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0439"
     ],
     "max_chars_member": 800,
-    "pause_read_messages_second": 60,
-    "read_delay_seconds": 60,
+    "pause_read_messages_second": 0,
+    "read_delay_seconds": 0,
+    "cycle_pause_seconds": 30,
     "check_interval_seconds": 5,
-    "debug_screenshots_enabled": true,
+    "debug_screenshots_enabled": false,
     "debug_screenshot_dir": "runtime_debug",
+    "debug_screenshot_max_files": 100,
     "candidate_missing_tolerance": 4,
     "candidate_match_tolerance_px": 180,
+    "candidate_y_dedupe_px": 120,
+    "page_duplicate_content_stop_after": 1,
     "seen_messages_file": "seen_messages.json",
     "seen_messages_limit": 1000,
     "sent_messages_file": "sent_messages.json",
     "sent_messages_limit": 1000,
+    "message_registry_reset_interval_seconds": 3600,
+    "message_registry_preserve_latest_count": 3,
     "viber_window_title_re": ".*Viber.*",
     "viber_exe_path": "C:\\Users\\ariab\\AppData\\Local\\Viber\\Viber.exe",
     "viber_open_timeout_seconds": 20,
@@ -50,9 +56,10 @@
         "right_padding": 18,
         "top_padding": 0,
         "bottom_padding": 0,
-        "scan_step_px": 80,
+        "scan_step_px": 60,
         "scan_step_offsets_px": [
             0,
+            20,
             40
         ],
         "scan_bottom_probe_offsets_px": [
@@ -67,16 +74,68 @@
         "message_click_x_ratios": [
             0.22,
             0.34
-        ]
+        ],
+        "reaction_anchor": {
+            "enabled": true,
+            "template_path": "images/viber_heart_anchor.png",
+            "template_paths": [
+                "images/viber_heart_anchor.png",
+                "images/viber_heart_anchor_clicked.png"
+            ],
+            "threshold": 0.82,
+            "dedupe_y_tolerance_px": 28,
+            "click_offset_x_px": -140,
+            "click_offset_y_px": 0,
+            "min_click_left_padding_px": 35,
+            "max_click_right_padding_px": 35
+        },
+        "media_group_anchor": {
+            "enabled": true,
+            "template_path": "images/viber_media_group_anchor.png",
+            "threshold": 0.86,
+            "dedupe_y_tolerance_px": 32,
+            "minimum_items": 2,
+            "tile_offsets_px": [
+                [-245, -83],
+                [-80, -83],
+                [-245, 81],
+                [-80, 81]
+            ]
+        },
+        "scroll_bottom_anchor": {
+            "enabled": true,
+            "template_path": "images/viber_scroll_bottom_anchor.png",
+            "threshold": 0.86,
+            "search_width_px": 120,
+            "search_height_px": 150,
+            "click_wait_ms": 800,
+            "wheel_fallback_enabled": false
+        }
     },
-    "marker_send_down_scroll_count": 3,
+    "marker_stop_after_sent_count": 3,
+    "marker_send_down_scroll_count": 1,
+    "bottom_control_passes": 1,
+    "bottom_same_content_pages": 2,
+    "long_text_skip_enabled": false,
+    "inspect_probe_offsets": [
+        [
+            0,
+            0
+        ]
+    ],
     "context_menu": {
         "width": 260,
-        "height": 260,
+        "height": 430,
         "left_offset": -40,
         "top_offset": -180,
         "first_action_offset_x": 90,
-        "first_action_offset_y": 4
+        "first_action_offset_y": 4,
+        "show_in_folder_fallback_rect": [
+            82,
+            260,
+            150,
+            45
+        ]
     },
     "search_phrases": {
         "isText": "\u0421\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435",

@@ -1,17 +1,28 @@
 import hashlib
 import json
 import os
+import time
 from collections import deque
 
 
 class MessageStore:
-    def __init__(self, path="sent_messages.json", max_items=1000):
+    def __init__(
+        self,
+        path="sent_messages.json",
+        max_items=1000,
+        reset_interval_seconds=0,
+        preserve_latest_count=0,
+    ):
         self.path = path
         self.max_items = max_items
+        self.reset_interval_seconds = max(0, int(reset_interval_seconds or 0))
+        self.preserve_latest_count = max(0, int(preserve_latest_count or 0))
         self.text_hashes = deque(maxlen=max_items)
         self.image_hashes = deque(maxlen=max_items)
         self.file_hashes = deque(maxlen=max_items)
         self.deliveries = {}
+        self.completed_order = deque(maxlen=max_items)
+        self.last_reset_at = time.time()
         self.load()
 
     def load(self):
@@ -28,6 +39,22 @@ class MessageStore:
         self.image_hashes = deque(data.get("image_hashes", []), maxlen=self.max_items)
         self.file_hashes = deque(data.get("file_hashes", []), maxlen=self.max_items)
         self.deliveries = data.get("deliveries", {})
+        completed_order = data.get("completed_order")
+        if not isinstance(completed_order, list):
+            # Dict insertion order gives old registries a useful migration path.
+            completed_order = list(reversed(self.deliveries))
+        self.completed_order = deque(completed_order, maxlen=self.max_items)
+        try:
+            self.last_reset_at = float(data.get("last_reset_at", self.last_reset_at))
+        except (TypeError, ValueError):
+            self.last_reset_at = time.time()
+
+        # Old registry files have no reset timestamp. Preserve their contents for
+        # the first configured interval and persist the migrated format.
+        if "last_reset_at" not in data:
+            self.save()
+        else:
+            self.clear_if_expired()
 
     def save(self):
         data = {
@@ -35,9 +62,36 @@ class MessageStore:
             "image_hashes": list(self.image_hashes),
             "file_hashes": list(self.file_hashes),
             "deliveries": self.deliveries,
+            "completed_order": list(self.completed_order),
+            "last_reset_at": self.last_reset_at,
         }
         with open(self.path, "w", encoding="utf-8") as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
+
+    def clear_if_expired(self, now=None):
+        if self.reset_interval_seconds <= 0:
+            return False
+
+        now = time.time() if now is None else float(now)
+        if now - self.last_reset_at < self.reset_interval_seconds:
+            return False
+
+        preserved_keys = list(self.completed_order)[:self.preserve_latest_count]
+        self.text_hashes.clear()
+        self.image_hashes.clear()
+        self.file_hashes.clear()
+        self.deliveries = {
+            content_key: self.deliveries[content_key]
+            for content_key in preserved_keys
+            if content_key in self.deliveries
+        }
+        self.completed_order = deque(
+            (key for key in preserved_keys if key in self.deliveries),
+            maxlen=self.max_items,
+        )
+        self.last_reset_at = now
+        self.save()
+        return True
 
     def is_new_text(self, text):
         message_hash = hash_text(text)
@@ -55,6 +109,7 @@ class MessageStore:
         return self.mark_text_hash(message_hash)
 
     def mark_text_hash(self, message_hash):
+        self.clear_if_expired()
         if not message_hash or self.has_text_hash(message_hash):
             return False
         self.text_hashes.appendleft(message_hash)
@@ -62,6 +117,7 @@ class MessageStore:
         return True
 
     def mark_image(self, image_hash):
+        self.clear_if_expired()
         if not image_hash or self.has_image(image_hash):
             return False
         self.image_hashes.appendleft(image_hash)
@@ -69,6 +125,7 @@ class MessageStore:
         return True
 
     def mark_file(self, file_hash):
+        self.clear_if_expired()
         if not file_hash or self.has_file(file_hash):
             return False
         self.file_hashes.appendleft(file_hash)
@@ -80,15 +137,19 @@ class MessageStore:
         return self.has_text_hash(message_hash)
 
     def has_text_hash(self, message_hash):
+        self.clear_if_expired()
         return bool(message_hash and message_hash in self.text_hashes)
 
     def has_image(self, image_hash):
+        self.clear_if_expired()
         return bool(image_hash and image_hash in self.image_hashes)
 
     def has_file(self, file_hash):
+        self.clear_if_expired()
         return bool(file_hash and file_hash in self.file_hashes)
 
     def mark_delivered(self, content_key, target):
+        self.clear_if_expired()
         if not content_key or target is None:
             return False
         target_key = normalize_target_key(target)
@@ -101,11 +162,25 @@ class MessageStore:
         return True
 
     def has_delivery(self, content_key, target):
+        self.clear_if_expired()
         if not content_key or target is None:
             return False
         return normalize_target_key(target) in set(self.deliveries.get(content_key, []))
 
+    def mark_completed(self, content_key):
+        self.clear_if_expired()
+        if not content_key:
+            return False
+        try:
+            self.completed_order.remove(content_key)
+        except ValueError:
+            pass
+        self.completed_order.appendleft(content_key)
+        self.save()
+        return True
+
     def delivered_to_all(self, content_key, targets):
+        self.clear_if_expired()
         if not targets:
             return False
         delivered = set(self.deliveries.get(content_key, []))
