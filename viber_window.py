@@ -70,6 +70,82 @@ class ViberWindow:
         except Exception:
             pass
         time.sleep(0.2)
+        self.close_media_viewer_if_open()
+
+    def close_media_viewer_if_open(self):
+        anchor = self.settings.get("auto_capture", {}).get("media_viewer_close_anchor", {})
+        if not bool(anchor.get("enabled", True)):
+            return False
+
+        template_path = Path(str(anchor.get("template_path", "images/viber_media_viewer_close.png")))
+        if not template_path.is_file():
+            log_and_print(f"[ViberWindow] Media viewer close template not found: {template_path}", "warning")
+            return False
+
+        window_region = self.rect()
+        search_width = max(80, int(anchor.get("search_width_px", 140)))
+        search_height = max(50, int(anchor.get("search_height_px", 90)))
+        search_left = max(window_region.left, window_region.right - search_width)
+        search_bottom = min(window_region.bottom, window_region.top + search_height)
+        screenshot = ImageGrab.grab((search_left, window_region.top, window_region.right, search_bottom))
+        haystack = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2GRAY)
+        template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
+        if template is None or haystack.shape[0] < template.shape[0] or haystack.shape[1] < template.shape[1]:
+            log_and_print("[ViberWindow] Media viewer close template is not usable.", "warning")
+            return False
+
+        result = cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, location = cv2.minMaxLoc(result)
+        threshold = float(anchor.get("threshold", 0.88))
+        if score < threshold:
+            return False
+
+        click_x = search_left + location[0] + template.shape[1] // 2
+        click_y = window_region.top + location[1] + template.shape[0] // 2
+        mouse.click(button="left", coords=(click_x, click_y))
+        time.sleep(max(0, int(anchor.get("click_wait_ms", 700))) / 1000)
+        log_and_print(
+            "[ViberWindow] Blocking media viewer closed: "
+            f"coords=({click_x},{click_y}), score={score:.3f}"
+        )
+        return True
+
+    def exit_selection_mode_if_open(self):
+        anchor = self.settings.get("auto_capture", {}).get("selection_mode_anchor", {})
+        if not bool(anchor.get("enabled", True)):
+            return False
+
+        template_path = Path(str(anchor.get("template_path", "images/viber_selection_mode_anchor.png")))
+        if not template_path.is_file():
+            log_and_print(f"[ViberWindow] Selection mode template not found: {template_path}", "warning")
+            return False
+
+        self.focus()
+        window_region = self.rect()
+        left_offset = max(0, int(anchor.get("left_offset_px", 300)))
+        search_width = max(100, int(anchor.get("search_width_px", 220)))
+        search_height = max(40, int(anchor.get("search_height_px", 70)))
+        search_left = min(window_region.right, window_region.left + left_offset)
+        search_right = min(window_region.right, search_left + search_width)
+        search_top = max(window_region.top, window_region.bottom - search_height)
+        screenshot = ImageGrab.grab((search_left, search_top, search_right, window_region.bottom))
+        haystack = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2GRAY)
+        template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
+        if template is None or haystack.shape[0] < template.shape[0] or haystack.shape[1] < template.shape[1]:
+            log_and_print("[ViberWindow] Selection mode template is not usable.", "warning")
+            return False
+
+        result = cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, _ = cv2.minMaxLoc(result)
+        threshold = float(anchor.get("threshold", 0.88))
+        if score < threshold:
+            return False
+
+        win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
+        win32api.keybd_event(win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(max(0, int(anchor.get("escape_wait_ms", 500))) / 1000)
+        log_and_print(f"[ViberWindow] Stuck selection mode closed with Esc: score={score:.3f}")
+        return True
 
     def arrange_window(self):
         self.ensure_connected()
@@ -144,13 +220,24 @@ class ViberWindow:
         mouse.click(button=button, coords=(int(x), int(y)))
 
     def scroll_to_bottom(self, amount=5):
-        if self.click_scroll_to_bottom():
-            return True
         anchor = self.settings.get("auto_capture", {}).get("scroll_bottom_anchor", {})
+        retry_count = max(1, int(anchor.get("retry_count", 3)))
+        retry_wait = max(0, int(anchor.get("retry_wait_ms", 300))) / 1000
+        for attempt in range(retry_count):
+            if self.click_scroll_to_bottom():
+                return True
+            if attempt + 1 < retry_count:
+                win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
+                win32api.keybd_event(win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0)
+                time.sleep(retry_wait)
+
         if bool(anchor.get("wheel_fallback_enabled", False)):
             self.scroll(amount=amount, wheel_dist=-5)
         else:
-            log_and_print("[ViberWindow] Scroll-bottom button is absent; list is assumed to be at bottom.")
+            log_and_print(
+                "[ViberWindow] Scroll-bottom button was not found after "
+                f"{retry_count} attempts; list is assumed to be at bottom."
+            )
         return False
 
     def click_scroll_to_bottom(self):
@@ -181,7 +268,7 @@ class ViberWindow:
         threshold = float(anchor.get("threshold", 0.86))
         if score < threshold:
             log_and_print(
-                "[ViberWindow] Scroll-bottom button not found; using wheel fallback: "
+                "[ViberWindow] Scroll-bottom button not found: "
                 f"score={score:.3f}, threshold={threshold:.3f}"
             )
             return False

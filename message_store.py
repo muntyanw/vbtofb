@@ -22,6 +22,7 @@ class MessageStore:
         self.file_hashes = deque(maxlen=max_items)
         self.deliveries = {}
         self.completed_order = deque(maxlen=max_items)
+        self.protected_keys = deque(maxlen=max(1, self.preserve_latest_count))
         self.last_reset_at = time.time()
         self.load()
 
@@ -44,6 +45,13 @@ class MessageStore:
             # Dict insertion order gives old registries a useful migration path.
             completed_order = list(reversed(self.deliveries))
         self.completed_order = deque(completed_order, maxlen=self.max_items)
+        protected_keys = data.get("protected_keys", [])
+        if not isinstance(protected_keys, list):
+            protected_keys = []
+        self.protected_keys = deque(
+            protected_keys,
+            maxlen=max(1, self.preserve_latest_count),
+        )
         try:
             self.last_reset_at = float(data.get("last_reset_at", self.last_reset_at))
         except (TypeError, ValueError):
@@ -63,6 +71,7 @@ class MessageStore:
             "file_hashes": list(self.file_hashes),
             "deliveries": self.deliveries,
             "completed_order": list(self.completed_order),
+            "protected_keys": list(self.protected_keys),
             "last_reset_at": self.last_reset_at,
         }
         with open(self.path, "w", encoding="utf-8") as file:
@@ -76,7 +85,11 @@ class MessageStore:
         if now - self.last_reset_at < self.reset_interval_seconds:
             return False
 
-        preserved_keys = list(self.completed_order)[:self.preserve_latest_count]
+        protected_keys = [
+            key for key in self.protected_keys
+            if key in self.deliveries
+        ]
+        preserved_keys = protected_keys or list(self.completed_order)[:self.preserve_latest_count]
         self.text_hashes.clear()
         self.image_hashes.clear()
         self.file_hashes.clear()
@@ -89,7 +102,34 @@ class MessageStore:
             (key for key in preserved_keys if key in self.deliveries),
             maxlen=self.max_items,
         )
+        self.protected_keys = deque(
+            (key for key in protected_keys if key in self.deliveries),
+            maxlen=max(1, self.preserve_latest_count),
+        )
         self.last_reset_at = now
+        self.save()
+        return True
+
+    def set_protected_keys(self, content_keys):
+        if self.preserve_latest_count <= 0:
+            return False
+
+        unique_keys = []
+        for content_key in content_keys or []:
+            if not content_key or content_key in unique_keys:
+                continue
+            if content_key not in self.deliveries:
+                continue
+            unique_keys.append(content_key)
+            if len(unique_keys) >= self.preserve_latest_count:
+                break
+
+        if list(self.protected_keys) == unique_keys:
+            return False
+        self.protected_keys = deque(
+            unique_keys,
+            maxlen=max(1, self.preserve_latest_count),
+        )
         self.save()
         return True
 

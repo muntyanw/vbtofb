@@ -25,6 +25,7 @@
     "debug_screenshots_enabled": false,
     "debug_screenshot_dir": "runtime_debug",
     "debug_screenshot_max_files": 100,
+    "runtime_artifact_cleanup_on_start": true,
     "candidate_missing_tolerance": 4,
     "candidate_match_tolerance_px": 180,
     "candidate_y_dedupe_px": 120,
@@ -102,17 +103,37 @@
                 [-80, 81]
             ]
         },
+        "media_viewer_close_anchor": {
+            "enabled": true,
+            "template_path": "images/viber_media_viewer_close.png",
+            "threshold": 0.88,
+            "search_width_px": 140,
+            "search_height_px": 90,
+            "click_wait_ms": 700
+        },
+        "selection_mode_anchor": {
+            "enabled": true,
+            "template_path": "images/viber_selection_mode_anchor.png",
+            "threshold": 0.88,
+            "left_offset_px": 300,
+            "search_width_px": 220,
+            "search_height_px": 70,
+            "escape_wait_ms": 500
+        },
         "scroll_bottom_anchor": {
             "enabled": true,
             "template_path": "images/viber_scroll_bottom_anchor.png",
-            "threshold": 0.86,
+            "threshold": 0.74,
             "search_width_px": 120,
             "search_height_px": 150,
             "click_wait_ms": 800,
+            "retry_count": 3,
+            "retry_wait_ms": 300,
             "wheel_fallback_enabled": false
         }
     },
     "marker_stop_after_sent_count": 3,
+    "marker_fallback_after_pages": 40,
     "marker_send_down_scroll_count": 1,
     "bottom_control_passes": 1,
     "bottom_same_content_pages": 2,

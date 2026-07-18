@@ -22,6 +22,7 @@ from init import init as load_config
 from log import log_and_print
 from message_store import MessageStore, hash_file, hash_text, normalize_text
 from recognize_text import capture_and_find_multiple_text_coordinates
+from runtime_cleanup import cleanup_runtime_artifacts
 from tg import startTgClient
 from vb_utils import process_one_message, reformat_telegram_text
 from viber_window import ViberWindow
@@ -79,6 +80,7 @@ class AutoBridge:
         if not self.viber.ensure_channel():
             raise RuntimeError("Cannot find or confirm the configured Viber channel.")
 
+        self.recover_stuck_selection_mode()
         self.viber.scroll_to_bottom(self._setting_int("scroll_to_bottom_count", 3))
         log_and_print(
             "[AutoBridge] Started. "
@@ -87,6 +89,7 @@ class AutoBridge:
 
         while True:
             try:
+                self.recover_stuck_selection_mode()
                 self.reset_expired_message_registries()
                 if self._backlog_scan_enabled():
                     await self.process_marker_cycle()
@@ -96,6 +99,22 @@ class AutoBridge:
                 log_and_print(f"[AutoBridge] Read loop error: {exc}", "error")
                 log_and_print(traceback.format_exc(), "error")
             await asyncio.sleep(self._check_interval())
+
+    def recover_stuck_selection_mode(self):
+        if not self.viber.exit_selection_mode_if_open():
+            return False
+
+        self.marker_cycle_phase = "idle"
+        self.pending_candidates.clear()
+        self.known_candidate_signatures.clear()
+        self.marker_cycle_message_cache.clear()
+        self.backlog_scanned_signatures.clear()
+        self.backlog_processed_content_keys.clear()
+        log_and_print(
+            "[AutoBridge] Viber selection mode recovery completed; "
+            "the scan will restart from the bottom."
+        )
+        return True
 
     def reset_expired_message_registries(self):
         sent_cleared = self.sent_store.clear_if_expired()
@@ -164,6 +183,8 @@ class AutoBridge:
         self.marker_cycle_find_pages += 1
 
         if not visible:
+            if await self.start_marker_fallback_send_down_if_due():
+                return
             log_and_print("[AutoBridge] Marker search page has no candidates; scrolling up.")
             self.viber.scroll(amount=self._setting_int("backlog_scroll_count", 1), wheel_dist=5)
             cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
@@ -201,6 +222,7 @@ class AutoBridge:
                 )
                 if self.marker_cycle_boundary_streak >= self._marker_stop_after_sent_count():
                     self.marker_cycle_phase = "send_down"
+                    self.sent_store.set_protected_keys(self.marker_cycle_boundary_keys)
                     # Registry expiry may happen during a long video backlog.
                     # Keep boundary messages protected for this whole cycle so
                     # reaching them again on the downward pass cannot resend them.
@@ -222,22 +244,33 @@ class AutoBridge:
                 f"the three-message boundary is confirmed: {content_key}"
             )
 
-        max_pages = self._setting_int("marker_search_max_pages", 80)
-        if self.marker_cycle_find_pages >= max_pages:
-            log_and_print(
-                "[AutoBridge] Sent marker was not found before max pages; "
-                "pausing and will retry from bottom.",
-                "warning",
-            )
-            self.complete_marker_cycle()
+        if await self.start_marker_fallback_send_down_if_due():
             return
 
+        fallback_pages = self._marker_fallback_after_pages()
         log_and_print(
             "[AutoBridge] Sent marker not found on this page; scrolling up. "
-            f"pages={self.marker_cycle_find_pages}/{max_pages}"
+            f"pages={self.marker_cycle_find_pages}/{fallback_pages}"
         )
         self.viber.scroll(amount=self._setting_int("backlog_scroll_count", 1), wheel_dist=5)
         cv2.waitKey(self._setting_int("backlog_scroll_wait_ms", 500))
+
+    async def start_marker_fallback_send_down_if_due(self):
+        fallback_pages = self._marker_fallback_after_pages()
+        if self.marker_cycle_find_pages < fallback_pages:
+            return False
+
+        self.marker_cycle_phase = "send_down"
+        self.marker_cycle_marker_y = None
+        self.marker_cycle_sent_keys.update(self.marker_cycle_boundary_keys)
+        log_and_print(
+            "[AutoBridge] Three-message sent boundary was not found within "
+            f"{fallback_pages} pages; sending downward from the oldest reached page. "
+            f"protected_sent_keys={len(self.marker_cycle_boundary_keys)}",
+            "warning",
+        )
+        await self.send_pending_down_page()
+        return True
 
     async def send_pending_down_page(self):
         self.viber.focus()
@@ -245,7 +278,7 @@ class AutoBridge:
         self.save_debug_screenshot("marker_send_down")
         page_signature = self.visible_page_signature(visible)
 
-        if page_signature and page_signature == self.marker_cycle_last_down_signature:
+        if visible and page_signature == self.marker_cycle_last_down_signature:
             log_and_print("[AutoBridge] Bottom reached after downward send scan.")
             if self.start_bottom_control_scan_if_needed():
                 return
@@ -1075,12 +1108,21 @@ class AutoBridge:
         if message["type"] == "media_group":
             items = message.get("items", [])
             group_key = self.message_content_key(message)
+            unique_item_keys = set()
             log_and_print(
                 f"[AutoBridge] Sending media group to Telegram target {channel_name}: "
                 f"items={len(items)}"
             )
             for index, item in enumerate(items, start=1):
                 item_key = self.message_content_key(item)
+                if item_key in unique_item_keys:
+                    log_and_print(
+                        "[AutoBridge] Duplicate media group item blocked before Telegram send: "
+                        f"item={index}/{len(items)}, target={channel_name}, key={item_key}",
+                        "warning",
+                    )
+                    continue
+                unique_item_keys.add(item_key)
                 item_delivery_key = f"{group_key}:item:{index}:{item_key}"
                 if self.sent_store.has_delivery(item_delivery_key, channel_name):
                     log_and_print(
@@ -1285,6 +1327,7 @@ class AutoBridge:
             return None
 
         items = []
+        item_keys = set()
         log_and_print(
             "[AutoBridge] Reading media group tiles: "
             f"anchor=({candidate['x']},{candidate['y']}), configured_tiles={len(offsets)}"
@@ -1311,6 +1354,7 @@ class AutoBridge:
                 "[AutoBridge] Reading media group tile: "
                 f"item={index}/{len(offsets)}, point=({tile_x},{tile_y})"
             )
+            self.clear_clipboard()
             item = self.copy_candidate_after_delay(tile_candidate)
             pyautogui.press("esc")
             cv2.waitKey(self._setting_int("media_group_tile_wait_ms", 300))
@@ -1321,6 +1365,16 @@ class AutoBridge:
                     "warning",
                 )
                 return None
+            item_key = self.message_content_key(item)
+            if item_key in item_keys:
+                log_and_print(
+                    "[AutoBridge] Media group tile copied the same content as an earlier tile; "
+                    "aborting the group without sending: "
+                    f"item={index}/{len(offsets)}, key={item_key}",
+                    "warning",
+                )
+                return None
+            item_keys.add(item_key)
             items.append(item)
 
         if len(items) < minimum_items:
@@ -1330,12 +1384,12 @@ class AutoBridge:
             )
             return None
 
-        item_keys = [self.message_content_key(item) for item in items]
-        log_and_print(f"[AutoBridge] Media group read successfully: item_keys={item_keys}")
+        ordered_item_keys = [self.message_content_key(item) for item in items]
+        log_and_print(f"[AutoBridge] Media group read successfully: item_keys={ordered_item_keys}")
         return {
             "type": "media_group",
             "items": items,
-            "key": f"media_group:{hash_text('|'.join(item_keys))}",
+            "key": f"media_group:{hash_text('|'.join(ordered_item_keys))}",
         }
 
     def copy_selected_message(self, candidate, menu_region, menu_items, expected_type):
@@ -1895,6 +1949,9 @@ class AutoBridge:
     def _bottom_control_passes(self):
         return max(0, self._setting_int("bottom_control_passes", 1))
 
+    def _marker_fallback_after_pages(self):
+        return max(1, self._setting_int("marker_fallback_after_pages", 40))
+
     def _bottom_same_content_pages(self):
         return max(2, self._setting_int("bottom_same_content_pages", 2))
 
@@ -1961,8 +2018,17 @@ async def main():
             raise RuntimeError("Telegram client failed to start. See previous log lines for details.")
         bot_client, name_viber, _, channel_names = tg_start
         _, _, settings = load_config()
+        if settings.get("runtime_artifact_cleanup_on_start", True):
+            cleanup = cleanup_runtime_artifacts()
+            log_and_print(
+                "[AutoBridge] Runtime artifacts cleaned: "
+                f"directories={cleanup['directories']}, files={cleanup['files']}, "
+                f"bytes={cleanup['bytes']}"
+            )
         bridge = AutoBridge(bot_client, name_viber, channel_names, settings)
         await bridge.run()
+    except asyncio.CancelledError:
+        log_and_print("[AutoBridge] Stopped by user.")
     except KeyboardInterrupt:
         log_and_print("[AutoBridge] Stopped by user.")
     except Exception as exc:
@@ -1970,4 +2036,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log_and_print("[AutoBridge] Stopped by user.")
